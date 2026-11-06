@@ -48,7 +48,7 @@ public class Rows : contract::iterable<Row>
      */
     public const function outcome() : Outcome
     {
-        return $this->db->ending;
+        return $this->db->ending->settled($this->db->status);
     }
 
     /**

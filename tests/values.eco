@@ -229,6 +229,23 @@ test review_fixes_hold
     assert(textOf(Value::timestamp(DateTime(2024, 1, 1))) == '2024-01-01 00:00:00');
 }
 
+test text_integers_parse_in_place
+{
+    assert((intOf('0') ?? 1) == 0);
+    assert((intOf('-42') ?? 0) == -42);
+    assert((intOf('9223372036854775807') ?? 0) == std::math::MAX_INT64);
+    assert((intOf('-9223372036854775808') ?? 0) == std::math::MIN_INT64);
+    assert(intOf('9223372036854775808') == null);
+    assert(intOf('-9223372036854775809') == null);
+    assert(intOf('') == null);
+    assert(intOf('-') == null);
+    assert(intOf('1x') == null);
+    assert(intOf('+1') == null);
+    assert(pgsql::lastOf('a b c', 32) == 3);
+    assert(pgsql::lastOf('abc', 32) == 3);
+    assert(pgsql::lastOf('', 32) == 0);
+}
+
 test text_of_values
 {
     assert(floatText(0.1) == '0.1');

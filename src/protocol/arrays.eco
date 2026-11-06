@@ -92,22 +92,25 @@ internal function nest(mv array<Value> $flat, const array<usize>& $sizes) : Valu
     array<Value> $level = mv $flat;
     while ($d > 0) {
         usize $width = $sizes[$d];
-        array<Value> $up = array<Value>();
-        usize $at = 0;
-        while ($at < $level->count()) {
+        // popped twice, back to their order: pop hands each element over uncopied
+        array<Value> $back = arr::room<Value>($level->count());
+        while (!$level->empty()) {
+            $back->push($level->pop());
+        }
+        array<Value> $up = arr::room<Value>($back->count() / $width);
+        while (!$back->empty()) {
             array<Value> $group = arr::room<Value>($width);
             usize $k = 0;
             while ($k < $width) {
-                $group->push($level[$at + $k]);
+                $group->push($back->pop());
                 $k = $k + 1;
             }
             $up->push(.list(mv $group));
-            $at = $at + $width;
         }
         $level = mv $up;
         $d = $d - 1;
     }
-    return .list($level);
+    return .list(mv $level);
 }
 
 /**

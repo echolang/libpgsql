@@ -74,6 +74,21 @@ internal function unit(int64 $n, const string& $one, const string& $many) : stri
     return "{$n} {$many}";
 }
 
+/**
+ * The position of the last byte `$b` in `$s`, or its size when there is none.
+ */
+internal function lastOf(const string& $s, uint8 $b) : usize
+{
+    usize $i = $s->size();
+    while ($i > 0) {
+        $i = $i - 1;
+        if ($s->byte($i) == $b) {
+            return $i;
+        }
+    }
+    return $s->size();
+}
+
 namespace str;
 
 /**

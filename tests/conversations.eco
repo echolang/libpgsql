@@ -287,6 +287,39 @@ test a_stream_keeps_the_connection_busy_until_its_end
     $f->server->join();
 }
 
+test a_failed_stream_has_no_outcome_of_the_command_before
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(QUERY);
+        $w->send(COMMAND_COMPLETE, commandComplete('UPDATE 3'));
+        $w->ready();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['n:25'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        $w->batch();
+        $w->send(BIND_COMPLETE, '');
+        array<string> $a = ['a'];
+        $w->send(DATA_ROW, dataRow($a));
+        $w->error('22012', 'division by zero');
+        $w->ready(84);
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    assert(did($db->exec('UPDATE t SET a = 1'))->affectedRows == 3);
+    pgsql::Rows $rows = streamed($db->stream('SELECT n FROM t'));
+    assert($rows->finish()->failure()->is(.divisionByZero));
+    // not the UPDATE's tag and count
+    assert($rows->outcome()->affectedRows == 0);
+    assert($rows->outcome()->command == '');
+    // the status the failed stream's ReadyForQuery reported
+    assert($rows->outcome()->inTransaction());
+    $db->close();
+    $f->server->join();
+}
+
 test a_timeout_cancels_and_the_connection_stays
 {
     Fake $f = fake(function(Wire $w) : void {

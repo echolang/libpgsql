@@ -422,10 +422,13 @@ internal function unescape(const string& $s) : string?
         if ($i + 2 >= $s->size()) {
             return null;
         }
-        string $b = guard crypto::unhex($s->sub($i + 1, 2)) else {
+        uint8 $hi = guard nibble($s->byte($i + 1)) else {
             return null;
         }
-        $out->push($b->byte(0));
+        uint8 $lo = guard nibble($s->byte($i + 2)) else {
+            return null;
+        }
+        $out->push($hi * 16 + $lo);
         $i = $i + 3;
     }
     string? $done = $out;
@@ -433,19 +436,19 @@ internal function unescape(const string& $s) : string?
 }
 
 /**
- * The position of the last byte `$b` in `$s`, or its size when there is none.
+ * The value of the hex digit `$c`, either case, or null when it is not one.
  */
-internal function lastOf(const string& $s, uint8 $b) : usize
+internal function nibble(uint8 $c) : uint8?
 {
-    usize $at = $s->size();
-    usize $i = 0;
-    while ($i < $s->size()) {
-        if ($s->byte($i) == $b) {
-            $at = $i;
-        }
-        $i = $i + 1;
+    uint8? $v = null;
+    if ($c >= 48 && $c <= 57) {
+        $v = $c - 48;
+    } else if ($c >= 97 && $c <= 102) {
+        $v = $c - 87;
+    } else if ($c >= 65 && $c <= 70) {
+        $v = $c - 55;
     }
-    return $at;
+    return $v;
 }
 
 internal function port(const string& $text) : result<uint16, Error>

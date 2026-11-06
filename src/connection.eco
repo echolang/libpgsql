@@ -317,7 +317,7 @@ public class Connection
                 },
             }
         }
-        return .ok($this->settled($sets));
+        return .ok($this->settled(mv $sets));
     }
 
     /**
@@ -631,6 +631,7 @@ public class Connection
             return .error($e);
         }
         $this->pending = true;
+        $this->ending = Outcome();
         return .ok;
     }
 
@@ -681,11 +682,17 @@ public class Connection
     /**
      * `$sets`, collected before the command ended, with the transaction status it ended with.
      */
-    internal const function settled(const array<ResultSet>& $sets) : array<ResultSet>
+    internal const function settled(mv array<ResultSet> $sets) : array<ResultSet>
     {
-        array<ResultSet> $out = arr::room<ResultSet>($sets->count());
-        foreach ($sets as const &$rs) {
-            $out->push(ResultSet($rs->columns, $rs->rows, $rs->outcome->settled($this->status)));
+        // popped twice, back to their order: pop hands each set over, its rows uncopied
+        array<ResultSet> $back = arr::room<ResultSet>($sets->count());
+        while (!$sets->empty()) {
+            $back->push($sets->pop());
+        }
+        array<ResultSet> $out = arr::room<ResultSet>($back->count());
+        while (!$back->empty()) {
+            ResultSet $rs = $back->pop();
+            $out->push(ResultSet($rs->columns, mv $rs->rows, $rs->outcome->settled($this->status)));
         }
         return $out;
     }
@@ -1227,6 +1234,8 @@ public class Connection
     internal function refused(const Message& $m, tcp::Deadline $by) : Error
     {
         ServerError $s = pgsql::protocol::serverError($m->body);
+        // the failed command has no outcome, not the one before it
+        $this->ending = Outcome();
         guard $this->settle($by) else ($e) {
             return $e;
         }
@@ -1257,14 +1266,12 @@ public class Connection
                 tcp::Deadline $grace = tcp::Deadline(after: $this->options->cancelWait);
                 status<Error> $asked = pgsql::cancel($this->options, $this->key, by: $grace);
                 if ($asked->failed()) {
-                    $this->channel->close();
-                    return $e;
+                    return $this->broken($e);
                 }
                 while (true) {
                     result<Message, Error> $next = $this->channel->next($grace);
                     if ($next->failed()) {
-                        $this->channel->close();
-                        return $e;
+                        return $this->broken($e);
                     }
                     Message $m = $next->unwrap();
                     if ($m->type == pgsql::protocol::READY) {
@@ -1277,8 +1284,7 @@ public class Connection
                 return $e;
             },
             else => {
-                $this->channel->close();
-                return $e;
+                return $this->broken($e);
             },
         }
     }

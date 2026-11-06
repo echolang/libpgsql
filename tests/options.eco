@@ -37,6 +37,9 @@ test url_percent_decodes_and_takes_the_last_at
     assert($o->user == 'us@er');
     assert($o->password == 'p@ss:w/d');
     assert(($o->database ?? '') == 'my db');
+    // either case of hex digit
+    pgsql::Options $mixed = pgsql::Options::parse('postgres://a%3a%3Ab@h/x')->unwrap();
+    assert($mixed->user == 'a::b');
 }
 
 test url_ipv6_host
@@ -82,6 +85,8 @@ test url_refusals
     assert(pgsql::Options::parse('postgres://h/x?max_message=10')->failed());
     assert(pgsql::Options::parse('postgres://h/x?max_protocol_version=4')->failed());
     assert(pgsql::Options::parse('postgres://h/%zz')->failed());
+    assert(pgsql::Options::parse('postgres://h/%4g')->failed());
+    assert(pgsql::Options::parse('postgres://h/x%4')->failed());
     assert(pgsql::Options::parse('postgres://h/x?allow_cleartext=maybe')->failed());
     pgsql::Error $e = pgsql::Options::parse('postgres://h/x?nope=1')->failure();
     assert($e->name() == 'invalid');

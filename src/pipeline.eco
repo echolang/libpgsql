@@ -148,7 +148,7 @@ public class Pipeline
         guard $db->drain($until) else ($e) {
             return .error($e);
         }
-        return .ok($db->settled($out));
+        return .ok($db->settled(mv $out));
     }
 
     /**

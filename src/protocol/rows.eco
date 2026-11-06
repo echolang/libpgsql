@@ -419,6 +419,46 @@ internal function textValue(Shape $s, uint32 $oid, string::view $v) : result<Val
 }
 
 /**
+ * A text integer, an optional `-` and decimal digits, read in place: no owned copy for
+ * `str::int`. Null when `$v` is not one or does not fit an `int64`.
+ */
+internal function intOf(string::view $v) : int64?
+{
+    int64? $none = null;
+    usize $i = 0;
+    bool $negative = $v->size > 0 && $v->byte(0) == 45;
+    if ($negative) {
+        $i = 1;
+    }
+    if ($i >= $v->size) {
+        return $none;
+    }
+    // counted below zero, so the most negative int64 fits
+    int64 $n = 0;
+    while ($i < $v->size) {
+        uint8 $c = $v->byte($i);
+        if ($c < 48 || $c > 57) {
+            return $none;
+        }
+        int64 $d = ($c - 48) as int64;
+        if ($n < (std::math::MIN_INT64 + $d) / 10) {
+            return $none;
+        }
+        $n = $n * 10 - $d;
+        $i = $i + 1;
+    }
+    if ($negative) {
+        int64? $below = $n;
+        return $below;
+    }
+    if ($n == std::math::MIN_INT64) {
+        return $none;
+    }
+    int64? $above = -$n;
+    return $above;
+}
+
+/**
  * A bytea's text: `\x` and hex (the default output), or the escape format with `\\` and `\ooo`.
  */
 internal function byteaOf(const string& $t) : string?
@@ -486,7 +526,7 @@ internal struct Cell
             return null;
         }
         if (!$this->binary) {
-            return str::int(string::from($this->v));
+            return intOf($this->v);
         }
         usize $n = $this->v->size;
         if ($s == Shape::int4 && $n == 4) {
