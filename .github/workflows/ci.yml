@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2022]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: echolang/setup-echo@v1
+
+      - name: Vendor dependencies
+        run: epm install
+
+      # the protocol, auth and session tests: a scripted server, no PostgreSQL needed
+      - name: Test
+        run: echoc test --timeout 60000
+
+  live:
+    name: live (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['postgres:18-alpine']
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: echolang/setup-echo@v1
+
+      - name: Vendor dependencies
+        run: epm install
+
+      - name: Live tests
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: bash scripts/test-live.sh
