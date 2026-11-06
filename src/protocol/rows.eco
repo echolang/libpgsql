@@ -1,0 +1,644 @@
+/**
+ * Rows: what RowDescription announces, how a DataRow's values are found, and how each value is
+ * decoded from text or binary. A DataRow is a count, then each value as an int32 length (-1 for
+ * NULL) and its bytes.
+ */
+
+namespace pgsql::protocol;
+
+use pgsql::{Value, Date, Time, DateTime, Interval, Uuid, Column, Columns, PgType};
+
+// a NULL's start in `layout`'s positions
+internal const uint32 NULL_AT = 4294967295;
+
+// most columns a result may have: PostgreSQL allows 1664 in a target list
+internal const usize MAX_COLUMNS = 1664;
+
+// binary date and timestamp sentinels for infinity and -infinity
+internal const int32 DATE_INFINITY = 2147483647;
+internal const int32 DATE_PAST = -2147483648;
+internal const int64 TIMESTAMP_INFINITY = 9223372036854775807;
+internal const int64 TIMESTAMP_PAST = -9223372036854775808;
+
+// microseconds from 1970-01-01 to 2000-01-01
+internal const int64 PG_EPOCH_MICROS = 946684800000000;
+
+/**
+ * RowDescription: each column's name, table, attribute, type, size, modifier and format.
+ */
+internal function rowDescription(string::view $body) : result<Columns, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    uint16 $n = guard $c->u16() else ($e) {
+        return .error($e);
+    }
+    if (($n as usize) > MAX_COLUMNS) {
+        return .error(.malformed("a result of {$n} columns"));
+    }
+    array<Column> $list = arr::room<Column>($n as usize);
+    uint16 $i = 0;
+    while ($i < $n) {
+        string $name = guard $c->cstring() else ($e) {
+            return .error($e);
+        }
+        uint32 $table = guard $c->u32() else ($e) {
+            return .error($e);
+        }
+        int16 $attribute = guard $c->i16() else ($e) {
+            return .error($e);
+        }
+        uint32 $type = guard $c->u32() else ($e) {
+            return .error($e);
+        }
+        int16 $size = guard $c->i16() else ($e) {
+            return .error($e);
+        }
+        int32 $modifier = guard $c->i32() else ($e) {
+            return .error($e);
+        }
+        int16 $format = guard $c->i16() else ($e) {
+            return .error($e);
+        }
+        if ($format != TEXT && $format != BINARY) {
+            return .error(.malformed("format code {$format}"));
+        }
+        $list->push(Column($name, $table, $attribute, PgType::from($type), $size, $modifier, $format));
+        $i = $i + 1;
+    }
+    return .ok(Columns($list));
+}
+
+/**
+ * ParameterDescription: the type of each parameter, as the server inferred it.
+ */
+internal function parameterDescription(string::view $body) : result<array<uint32>, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    uint16 $n = guard $c->u16() else ($e) {
+        return .error($e);
+    }
+    if (($n as usize) * 4 != $c->left()) {
+        return .error(.malformed("{$n} parameter types in {$c->left()} bytes"));
+    }
+    array<uint32> $out = arr::room<uint32>($n as usize);
+    uint16 $i = 0;
+    while ($i < $n) {
+        $out->push($c->u32()->or(0));
+        $i = $i + 1;
+    }
+    return .ok($out);
+}
+
+/**
+ * Find where each value of the DataRow `$p` starts and how long it is. A NULL starts at
+ * `NULL_AT`. The row has to have one value per column and end with the last one.
+ */
+internal function layout(string::view $p, const Columns& $columns, array<uint32>& $starts, array<uint32>& $sizes) : status<pgsql::Error>
+{
+    usize $n = $columns->count();
+    usize $size = $p->size;
+    $starts->clear();
+    $sizes->clear();
+    if ($size < 2 || (tcp::wire::be16($p, 0) as usize) != $n) {
+        return .error(badRow($p, $n));
+    }
+    usize $at = 2;
+    usize $i = 0;
+    while ($i < $n) {
+        if ($size - $at < 4) {
+            return .error(.malformed("the row ends before value {$i}"));
+        }
+        uint32 $len = tcp::wire::be32($p, $at);
+        $at = $at + 4;
+        if ($len == NULL_AT) {
+            $starts->push(NULL_AT);
+            $sizes->push(0);
+        } else {
+            if (($len as usize) > $size - $at) {
+                return .error(.malformed("value {$i} of {$len} bytes runs past the row"));
+            }
+            $starts->push($at as uint32);
+            $sizes->push($len);
+            $at = $at + ($len as usize);
+        }
+        $i = $i + 1;
+    }
+    if ($at != $size) {
+        return .error(.malformed("{$size - $at} bytes after the last value"));
+    }
+    return .ok;
+}
+
+/**
+ * Decode the whole DataRow `$p` into `$out`, in the one walk that finds its values. Text values
+ * share `$p`'s bytes.
+ */
+internal function decodeRow(const string& $p, const Columns& $columns, array<Value>& $out) : status<pgsql::Error>
+{
+    usize $n = $columns->count();
+    usize $size = $p->size();
+    if ($size < 2 || (tcp::wire::be16($p, 0) as usize) != $n) {
+        return .error(badRow($p, $n));
+    }
+    usize $at = 2;
+    usize $i = 0;
+    while ($i < $n) {
+        if ($size - $at < 4) {
+            return .error(.malformed("the row ends before value {$i}"));
+        }
+        uint32 $len = tcp::wire::be32($p, $at);
+        $at = $at + 4;
+        if ($len == NULL_AT) {
+            $out->push(Value::none);
+            $i = $i + 1;
+            continue;
+        }
+        usize $l = $len as usize;
+        if ($l > $size - $at) {
+            return .error(.malformed("value {$i} of {$len} bytes runs past the row"));
+        }
+        Shape $s = $columns->shapes[$i];
+        bool $bin = $columns->binary[$i];
+        if ($s == Shape::text || $s == Shape::other) {
+            $out->push(.text($p->sub($at, $l)));
+        } else if ($s == Shape::numeric && !$bin) {
+            $out->push(.numeric($p->sub($at, $l)));
+        } else if ($s == Shape::json) {
+            $out->push(.json($p->sub($at, $l)));
+        } else {
+            Value $v = guard decode($s, $columns->list[$i]->type->value(), $bin, $p->view()->sub($at, $l)) else ($e) {
+                return .error($e);
+            }
+            $out->push($v);
+        }
+        $at = $at + $l;
+        $i = $i + 1;
+    }
+    if ($at != $size) {
+        return .error(.malformed("{$size - $at} bytes after the last value"));
+    }
+    return .ok;
+}
+
+internal function badRow(string::view $p, usize $columns) : pgsql::Error
+{
+    if ($p->size < 2) {
+        return .malformed('a row without its value count');
+    }
+    uint16 $values = tcp::wire::be16($p, 0);
+    return .malformed("a row of {$values} values for {$columns} columns");
+}
+
+/**
+ * One value, decoded as its shape says, from text or binary.
+ */
+internal function decode(Shape $s, uint32 $oid, bool $binary, string::view $v) : result<Value, pgsql::Error>
+{
+    if ($binary) {
+        return binaryValue($s, $oid, $v);
+    }
+    return textValue($s, $oid, $v);
+}
+
+internal function binaryValue(Shape $s, uint32 $oid, string::view $v) : result<Value, pgsql::Error>
+{
+    usize $n = $v->size;
+    if ($s == Shape::int4) {
+        if ($n != 4) {
+            return .error(width('int4', $n));
+        }
+        return .ok(.int(mem::bit_cast<int32, uint32>(tcp::wire::be32($v, 0)) as int64));
+    }
+    if ($s == Shape::int8) {
+        if ($n != 8) {
+            return .error(width('int8', $n));
+        }
+        return .ok(.int(mem::bit_cast<int64, uint64>(tcp::wire::be64($v, 0))));
+    }
+    if ($s == Shape::int2) {
+        if ($n != 2) {
+            return .error(width('int2', $n));
+        }
+        return .ok(.int(mem::bit_cast<int16, uint16>(tcp::wire::be16($v, 0)) as int64));
+    }
+    if ($s == Shape::oid) {
+        if ($n != 4) {
+            return .error(width('oid', $n));
+        }
+        return .ok(.int(tcp::wire::be32($v, 0) as int64));
+    }
+    if ($s == Shape::boolean) {
+        if ($n != 1) {
+            return .error(width('bool', $n));
+        }
+        return .ok(.bool($v->byte(0) != 0));
+    }
+    if ($s == Shape::float8) {
+        if ($n != 8) {
+            return .error(width('float8', $n));
+        }
+        return .ok(.float(mem::bit_cast<float64, uint64>(tcp::wire::be64($v, 0))));
+    }
+    if ($s == Shape::float4) {
+        if ($n != 4) {
+            return .error(width('float4', $n));
+        }
+        return .ok(.float(mem::bit_cast<float32, uint32>(tcp::wire::be32($v, 0)) as float64));
+    }
+    if ($s == Shape::text || $s == Shape::other) {
+        return .ok(.text(string::from($v)));
+    }
+    if ($s == Shape::json) {
+        return .ok(.json(string::from($v)));
+    }
+    if ($s == Shape::jsonb) {
+        if ($n < 1 || $v->byte(0) != 1) {
+            return .error(.malformed('jsonb without its version byte'));
+        }
+        return .ok(.json(string::from($v->sub(1, $n - 1))));
+    }
+    if ($s == Shape::bytea) {
+        return .ok(.bytes(string::from($v)));
+    }
+    if ($s == Shape::uuid) {
+        if ($n != 16) {
+            return .error(width('uuid', $n));
+        }
+        return .ok(.uuid(Uuid(string::from($v))));
+    }
+    if ($s == Shape::timestamptz || $s == Shape::timestamp) {
+        if ($n != 8) {
+            return .error(width('timestamp', $n));
+        }
+        DateTime $t = timestampOf(mem::bit_cast<int64, uint64>(tcp::wire::be64($v, 0)));
+        if ($s == Shape::timestamptz) {
+            return .ok(.timestamptz($t));
+        }
+        return .ok(.timestamp($t));
+    }
+    if ($s == Shape::date) {
+        if ($n != 4) {
+            return .error(width('date', $n));
+        }
+        return .ok(.date(dateOf(mem::bit_cast<int32, uint32>(tcp::wire::be32($v, 0)))));
+    }
+    if ($s == Shape::time) {
+        if ($n != 8) {
+            return .error(width('time', $n));
+        }
+        int64 $us = mem::bit_cast<int64, uint64>(tcp::wire::be64($v, 0));
+        if ($us < 0 || $us > 86400000000) {
+            return .error(.malformed("a time of {$us} microseconds"));
+        }
+        return .ok(.time(Time::fromMicros($us)));
+    }
+    if ($s == Shape::interval) {
+        if ($n != 16) {
+            return .error(width('interval', $n));
+        }
+        int64 $us = mem::bit_cast<int64, uint64>(tcp::wire::be64($v, 0));
+        int32 $days = mem::bit_cast<int32, uint32>(tcp::wire::be32($v, 8));
+        int32 $months = mem::bit_cast<int32, uint32>(tcp::wire::be32($v, 12));
+        return .ok(.interval(Interval($months, $days, $us)));
+    }
+    if ($s == Shape::array) {
+        return binaryArray($v);
+    }
+    // numeric never asked for in binary; a server that sends it anyway is read as bytes
+    return .ok(.bytes(string::from($v)));
+}
+
+internal function width(const string& $type, usize $n) : pgsql::Error
+{
+    return .malformed("a binary {$type} of {$n} bytes");
+}
+
+internal function dateOf(int32 $days) : Date
+{
+    if ($days == DATE_INFINITY) {
+        return Date::infinity();
+    }
+    if ($days == DATE_PAST) {
+        return Date::past();
+    }
+    return Date::fromUnixDays(($days as int64) + pgsql::PG_EPOCH_DAYS);
+}
+
+internal function timestampOf(int64 $us) : DateTime
+{
+    if ($us == TIMESTAMP_INFINITY) {
+        return DateTime::infinity();
+    }
+    if ($us == TIMESTAMP_PAST) {
+        return DateTime::past();
+    }
+    return DateTime(unixMicros: $us + PG_EPOCH_MICROS);
+}
+
+/**
+ * One value from its text, as the server writes it. Text that does not parse as its type (a
+ * session that changed `DateStyle` or `IntervalStyle`) comes back as `.text`, never as an error.
+ */
+internal function textValue(Shape $s, uint32 $oid, string::view $v) : result<Value, pgsql::Error>
+{
+    string $t = string::from($v);
+    if ($s == Shape::text || $s == Shape::other) {
+        return .ok(.text($t));
+    }
+    if ($s == Shape::int4 || $s == Shape::int8 || $s == Shape::int2 || $s == Shape::oid) {
+        int64 $n = guard str::int($t) else {
+            return .error(.malformed("'{$t}' is not an integer"));
+        }
+        return .ok(.int($n));
+    }
+    if ($s == Shape::numeric) {
+        return .ok(.numeric($t));
+    }
+    if ($s == Shape::boolean) {
+        if ($t == 't') {
+            return .ok(.bool(true));
+        }
+        if ($t == 'f') {
+            return .ok(.bool(false));
+        }
+        return .error(.malformed("'{$t}' is not a boolean"));
+    }
+    if ($s == Shape::float8 || $s == Shape::float4) {
+        float64 $f = guard str::float($t) else {
+            return .error(.malformed("'{$t}' is not a float"));
+        }
+        return .ok(.float($f));
+    }
+    if ($s == Shape::json || $s == Shape::jsonb) {
+        return .ok(.json($t));
+    }
+    if ($s == Shape::bytea) {
+        string $b = guard byteaOf($t) else {
+            return .error(.malformed('a bytea that is neither hex nor escape format'));
+        }
+        return .ok(.bytes($b));
+    }
+    if ($s == Shape::uuid) {
+        Uuid $u = guard Uuid::parse($t) else {
+            return .ok(.text($t));
+        }
+        return .ok(.uuid($u));
+    }
+    if ($s == Shape::date) {
+        Date $d = guard Date::parse($t) else {
+            return .ok(.text($t));
+        }
+        return .ok(.date($d));
+    }
+    if ($s == Shape::time) {
+        Time $c = guard Time::parse($t) else {
+            return .ok(.text($t));
+        }
+        return .ok(.time($c));
+    }
+    if ($s == Shape::timestamp || $s == Shape::timestamptz) {
+        DateTime $dt = guard DateTime::parse($t) else {
+            return .ok(.text($t));
+        }
+        if ($s == Shape::timestamptz) {
+            return .ok(.timestamptz($dt));
+        }
+        return .ok(.timestamp($dt));
+    }
+    if ($s == Shape::interval) {
+        Interval $i = guard Interval::parse($t) else {
+            return .ok(.text($t));
+        }
+        return .ok(.interval($i));
+    }
+    if ($s == Shape::array) {
+        uint32 $el = element($oid);
+        return textArray($t, shape($el), $el);
+    }
+    return .ok(.text($t));
+}
+
+/**
+ * A bytea's text: `\x` and hex (the default output), or the escape format with `\\` and `\ooo`.
+ */
+internal function byteaOf(const string& $t) : string?
+{
+    if ($t->starts('\\x')) {
+        return crypto::unhex($t->sub(2, $t->size() - 2));
+    }
+    string $out = '';
+    usize $i = 0;
+    while ($i < $t->size()) {
+        uint8 $c = $t->byte($i);
+        if ($c != 92) {
+            $out->push($c);
+            $i = $i + 1;
+            continue;
+        }
+        if ($i + 1 < $t->size() && $t->byte($i + 1) == 92) {
+            $out->push(92);
+            $i = $i + 2;
+            continue;
+        }
+        if ($i + 3 >= $t->size()) {
+            return null;
+        }
+        uint32 $o = 0;
+        usize $k = 1;
+        while ($k <= 3) {
+            uint8 $d = $t->byte($i + $k);
+            if ($d < 48 || $d > 55) {
+                return null;
+            }
+            $o = $o * 8 + ($d - 48) as uint32;
+            $k = $k + 1;
+        }
+        if ($o > 255) {
+            return null;
+        }
+        $out->push($o as uint8);
+        $i = $i + 4;
+    }
+    string? $done = $out;
+    return $done;
+}
+
+/**
+ * How to read one value of a row in place: where it is, its shape, and whether it is binary.
+ * Typed reads answer null for a value of another type.
+ */
+internal struct Cell
+{
+    internal string::view $v;
+    internal Shape $shape;
+    internal bool $binary;
+    internal uint32 $oid;
+
+    internal const function value() : result<Value, pgsql::Error>
+    {
+        return decode($this->shape, $this->oid, $this->binary, $this->v);
+    }
+
+    internal const function int() : int64?
+    {
+        Shape $s = $this->shape;
+        if ($s != Shape::int4 && $s != Shape::int8 && $s != Shape::int2 && $s != Shape::oid) {
+            return null;
+        }
+        if (!$this->binary) {
+            return str::int(string::from($this->v));
+        }
+        usize $n = $this->v->size;
+        if ($s == Shape::int4 && $n == 4) {
+            int64? $i4 = mem::bit_cast<int32, uint32>(tcp::wire::be32($this->v, 0)) as int64;
+            return $i4;
+        }
+        if ($s == Shape::int8 && $n == 8) {
+            int64? $i8 = mem::bit_cast<int64, uint64>(tcp::wire::be64($this->v, 0));
+            return $i8;
+        }
+        if ($s == Shape::int2 && $n == 2) {
+            int64? $i2 = mem::bit_cast<int16, uint16>(tcp::wire::be16($this->v, 0)) as int64;
+            return $i2;
+        }
+        if ($s == Shape::oid && $n == 4) {
+            int64? $o = tcp::wire::be32($this->v, 0) as int64;
+            return $o;
+        }
+        return null;
+    }
+
+    internal const function float() : float64?
+    {
+        Shape $s = $this->shape;
+        if ($s == Shape::float8 && $this->binary && $this->v->size == 8) {
+            float64? $f8 = mem::bit_cast<float64, uint64>(tcp::wire::be64($this->v, 0));
+            return $f8;
+        }
+        if ($s == Shape::float4 && $this->binary && $this->v->size == 4) {
+            float64? $f4 = mem::bit_cast<float32, uint32>(tcp::wire::be32($this->v, 0)) as float64;
+            return $f4;
+        }
+        if ($s == Shape::float8 || $s == Shape::float4 || $s == Shape::numeric) {
+            if ($this->binary && $s != Shape::numeric) {
+                return null;
+            }
+            return str::float(string::from($this->v));
+        }
+        int64 $n = guard $this->int() else {
+            return null;
+        }
+        float64? $out = $n as float64;
+        return $out;
+    }
+
+    internal const function bool() : bool?
+    {
+        if ($this->shape != Shape::boolean || $this->v->size != 1) {
+            return null;
+        }
+        uint8 $b = $this->v->byte(0);
+        if ($this->binary) {
+            bool? $bin = $b != 0;
+            return $bin;
+        }
+        if ($b == 116) {
+            return true;
+        }
+        if ($b == 102) {
+            return false;
+        }
+        return null;
+    }
+
+    /**
+     * Text in place: text and every type read as text, a numeric as written, JSON.
+     */
+    internal const function text() : string::view?
+    {
+        Shape $s = $this->shape;
+        if ($s == Shape::text || $s == Shape::other || $s == Shape::json) {
+            string::view? $t = $this->v;
+            return $t;
+        }
+        if ($s == Shape::numeric && !$this->binary) {
+            string::view? $n = $this->v;
+            return $n;
+        }
+        if ($s == Shape::jsonb) {
+            if (!$this->binary) {
+                string::view? $jt = $this->v;
+                return $jt;
+            }
+            if ($this->v->size >= 1 && $this->v->byte(0) == 1) {
+                string::view? $jb = $this->v->sub(1, $this->v->size - 1);
+                return $jb;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A bytea's bytes, or text's bytes.
+     */
+    internal const function bytes() : string?
+    {
+        if ($this->shape == Shape::bytea) {
+            if ($this->binary) {
+                string? $raw = string::from($this->v);
+                return $raw;
+            }
+            return byteaOf(string::from($this->v));
+        }
+        string::view $t = guard $this->text() else {
+            return null;
+        }
+        string? $out = string::from($t);
+        return $out;
+    }
+
+    internal const function date() : Date?
+    {
+        return $this->decoded()?->date();
+    }
+
+    internal const function time() : Time?
+    {
+        return $this->decoded()?->time();
+    }
+
+    internal const function datetime() : DateTime?
+    {
+        Shape $s = $this->shape;
+        if (($s == Shape::timestamptz || $s == Shape::timestamp) && $this->binary && $this->v->size == 8) {
+            DateTime? $t = timestampOf(mem::bit_cast<int64, uint64>(tcp::wire::be64($this->v, 0)));
+            return $t;
+        }
+        return $this->decoded()?->datetime();
+    }
+
+    internal const function interval() : Interval?
+    {
+        return $this->decoded()?->interval();
+    }
+
+    internal const function uuid() : Uuid?
+    {
+        return $this->decoded()?->uuid();
+    }
+
+    internal const function list() : array<Value>?
+    {
+        return $this->decoded()?->list();
+    }
+
+    private const function decoded() : Value?
+    {
+        result<Value, pgsql::Error> $r = $this->value();
+        if ($r->failed()) {
+            return null;
+        }
+        Value? $v = $r->unwrap();
+        return $v;
+    }
+}

@@ -1,0 +1,55 @@
+namespace pgsql;
+
+/**
+ * What a cancel request has to show: the session's process id and its secret. Plain data, so
+ * another thread can cancel the statement a connection is busy with.
+ */
+public struct CancelKey
+{
+    /**
+     * The server process serving the session. What `pg_cancel_backend` and
+     * `pg_stat_activity.pid` know it by.
+     */
+    public const uint32 $pid;
+    internal const string $secret;
+}
+
+/**
+ * Ask the server to cancel what the session with `$key` is running, over a connection of its
+ * own. The server does not answer: whether a statement was running, and stopped, shows on the
+ * session itself (`.queryCanceled`).
+ */
+public function cancel(const Options& $o, const CancelKey& $key, by: tcp::Deadline? $by = null) : status<Error>
+{
+    tcp::Deadline $until = $by ?? tcp::Deadline(after: $o->connectTimeout);
+    tcp::Stream $s = guard dial($o, $until) else ($e) {
+        return .error($e);
+    }
+    string $request = pgsql::protocol::cancelRequest($key->pid, $key->secret);
+    guard $s->write($request, $until) else ($e) {
+        $s->close();
+        return .error(transportError($e));
+    }
+    // the server reads the request and hangs up; waiting for that makes sure it arrived
+    status<tcp::Error> $done = $s->finish($until);
+    return .ok;
+}
+
+/**
+ * The stream to the server the options name: its unix socket, or its host and port.
+ */
+internal function dial(const Options& $o, tcp::Deadline $by) : result<tcp::Stream, Error>
+{
+    string? $socket = $o->socketPath();
+    if ($socket != null) {
+        string $path = guard $socket;
+        tcp::Stream $u = guard tcp::Stream::connect(tcp::Address(unix: $path), $by) else ($e) {
+            return .error(transportError($e));
+        }
+        return .ok($u);
+    }
+    tcp::Stream $s = guard tcp::Stream::connect(host: $o->host, $o->port, $by) else ($e) {
+        return .error(transportError($e));
+    }
+    return .ok($s);
+}

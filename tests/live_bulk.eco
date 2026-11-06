@@ -1,0 +1,236 @@
+/**
+ * COPY, pipelines and the pool against a real server.
+ */
+
+#[if: pgsql]
+
+use std::thread;
+use std::time;
+
+#[group: 'live']
+test live_copy_in_and_out
+{
+    pgsql::Connection $db = live();
+    did($db->exec('DROP TABLE IF EXISTS cp; CREATE TABLE cp (id int, name text, price numeric, seen timestamptz, tags text[])'));
+    pgsql::CopyIn $in = guard $db->copyIn('COPY cp FROM STDIN') else ($e) {
+        die("copyIn: {$e}");
+    }
+    assert(!$in->binary);
+    assert(failsStatus($db->ping())->name() == 'busy');
+    int32 $i = 0;
+    while ($i < 100000) {
+        array<string> $tags = ["t{$i}", 'tab\there', 'quote"'];
+        array<pgsql::Value> $row = [$i, "name\\{$i}\nline", .numeric('1.50'), pgsql::Value::timestamptz(pgsql::DateTime(2024, 1, 2, 3, 4, 5, 6)), $tags];
+        if ($i % 10 == 0) {
+            $row[1] = pgsql::Value::none;
+        }
+        fine($in->row($row));
+        $i = $i + 1;
+    }
+    pgsql::Outcome $o = guard $in->finish() else ($e) {
+        die("finish: {$e}");
+    }
+    assert($o->affectedRows == 100000);
+    assert($o->command == 'COPY');
+    pgsql::ResultSet $chk = got($db->query('SELECT count(*) AS n, count(name) AS named, max(id) AS top FROM cp'));
+    assert(($chk[0]['n']->int() ?? 0) == 100000);
+    assert(($chk[0]['named']->int() ?? 0) == 90000);
+    pgsql::ResultSet $one = got($db->query('SELECT name, tags, seen FROM cp WHERE id = 7'));
+    assert(($one[0]['name']->text() ?? '') == "name\\7\nline");
+    assert("{$one[0]['tags']}" == "\{\"t7\",\"tab\there\",\"quote\\\"\"}");
+    assert("{$one[0]['seen']}" == '2024-01-02 03:04:05.000006+00');
+
+    // a bad row fails the whole COPY, and the connection is fine after
+    pgsql::CopyIn $bad = guard $db->copyIn('COPY cp (id) FROM STDIN') else ($e) {
+        die("copyIn: {$e}");
+    }
+    fine($bad->write("1\nnot a number\n"));
+    result<pgsql::Outcome, pgsql::Error> $why = $bad->finish();
+    assert($why->failure()->is(.invalidTextRepresentation));
+    fine($db->ping());
+
+    // abandoned on purpose
+    pgsql::CopyIn $gone = guard $db->copyIn('COPY cp (id) FROM STDIN') else ($e) {
+        die("copyIn: {$e}");
+    }
+    fine($gone->write("5\n"));
+    fine($gone->abort('never mind'));
+    fine($db->ping());
+
+    // binary COPY by table and columns, json included; a row that does not encode leaves nothing
+    did($db->exec('DROP TABLE IF EXISTS cpb; CREATE TABLE cpb (id int4, doc jsonb, at timestamptz, n numeric)'));
+    array<string> $cols = ['id', 'doc', 'at'];
+    pgsql::CopyIn $b = guard $db->copyIn(table: 'cpb', $cols) else ($e) {
+        die("copyIn table: {$e}");
+    }
+    assert($b->binary);
+    array<pgsql::Value> $good = [1, .json('{"k": [1, 2]}'), pgsql::Value::timestamptz(pgsql::DateTime(2024, 5, 6, 7, 8, 9))];
+    fine($b->row($good));
+    array<pgsql::Value> $big = [3000000000, .json('{}'), pgsql::Value::none];
+    assert(failsStatus($b->row($big))->name() == 'invalid');
+    array<pgsql::Value> $later = [2, '"a text that is json"', pgsql::Value::none];
+    fine($b->row($later));
+    pgsql::Outcome $bo = guard $b->finish() else ($e) {
+        die("binary finish: {$e}");
+    }
+    assert($bo->affectedRows == 2);
+    pgsql::ResultSet $bin = got($db->query('SELECT doc, at FROM cpb ORDER BY id'));
+    assert(($bin[0]['doc']->json() ?? '') == '{"k": [1, 2]}');
+    assert("{$bin[0]['at']}" == '2024-05-06 07:08:09+00');
+    // a NUMERIC column has no binary form here: the COPY runs as text
+    array<string> $withN = ['id', 'n'];
+    pgsql::CopyIn $t = guard $db->copyIn(table: 'cpb', $withN) else ($e) {
+        die("copyIn table: {$e}");
+    }
+    assert(!$t->binary);
+    array<pgsql::Value> $nrow = [9, .numeric('1.25')];
+    fine($t->row($nrow));
+    assert(did($t->finish())->affectedRows == 1);
+    did($db->exec('DROP TABLE cpb'));
+
+    pgsql::CopyOut $out = guard $db->copyOut('COPY (SELECT id, name FROM cp WHERE id < 5 ORDER BY id) TO STDOUT') else ($e) {
+        die("copyOut: {$e}");
+    }
+    array<string> $lines = array<string>();
+    while (true) {
+        string::view? $chunk = guard $out->next() else ($e) {
+            die("next: {$e}");
+        }
+        string::view $c = guard $chunk else {
+            break;
+        }
+        $lines->push(string($c));
+    }
+    assert($lines->count() == 5);
+    assert($lines[0] == "0\t\\N\n");
+    assert($lines[1] == "1\tname\\\\1\\nline\n");
+    assert($out->outcome()->affectedRows == 5);
+    fine($db->ping());
+
+    // not a COPY, or the wrong direction
+    pgsql::Connection $other = live();
+    assert($other->copyIn('SELECT 1')->failure()->name() == 'invalid');
+    assert($other->copyIn('COPY cp TO STDOUT')->failure()->name() == 'invalid');
+    fine($other->ping());
+    assert($other->copyOut('COPY nope FROM STDIN')->failure()->is(.undefinedTable));
+    fine($other->ping());
+    // a COPY sent as a query is refused, connection fine
+    assert(failsExec($other->exec('COPY cp (id) FROM STDIN'))->name() == 'server');
+    fine($other->ping());
+    did($db->exec('DROP TABLE cp'));
+}
+
+#[group: 'live']
+test live_pipelines
+{
+    array<pgsql::Connection> $both = modes();
+    foreach ($both as $db) {
+        did($db->exec('DROP TABLE IF EXISTS pl; CREATE TABLE pl (id int PRIMARY KEY, name text)'));
+        pgsql::Pipeline $p = $db->pipeline();
+        int32 $i = 0;
+        while ($i < 1000) {
+            $p->add('INSERT INTO pl VALUES (:id, :name)', ['id' => $i, 'name' => "n{$i}"]);
+            $i = $i + 1;
+        }
+        $p->add('SELECT count(*) AS n FROM pl');
+        array<pgsql::ResultSet> $done = guard $p->run() else ($e) {
+            die("pipeline: {$e}");
+        }
+        assert($done->count() == 1001);
+        assert($done[0]->outcome->affectedRows == 1);
+        assert(($done[1000][0]['n']->int() ?? 0) == 1000);
+
+        // one failure rolls back the whole pipeline
+        pgsql::Pipeline $bad = $db->pipeline();
+        $bad->add('INSERT INTO pl VALUES (5000, :n)', ['n' => 'a']);
+        $bad->add('INSERT INTO pl VALUES (1, :n)', ['n' => 'duplicate']);
+        $bad->add('INSERT INTO pl VALUES (5001, :n)', ['n' => 'b']);
+        result<array<pgsql::ResultSet>, pgsql::Error> $r = $bad->run();
+        assert($r->failure()->is(.uniqueViolation));
+        assert(($bad->failedAt() ?? 99) == 1);
+        assert((got($db->query('SELECT count(*) AS n FROM pl WHERE id >= 5000'))[0]['n']->int() ?? 9) == 0);
+
+        // a schema change between runs: the cached statement is prepared again
+        pgsql::Pipeline $sel = $db->pipeline();
+        $sel->add('SELECT * FROM pl WHERE id = :id', ['id' => 1]);
+        array<pgsql::ResultSet> $before = guard $sel->run() else ($e) {
+            die("{$e}");
+        }
+        assert($before[0]->columns->count() == 2);
+        did($db->exec('ALTER TABLE pl ADD COLUMN extra int'));
+        array<pgsql::ResultSet> $after = guard $sel->run() else ($e) {
+            die("after alter: {$e}");
+        }
+        assert($after[0]->columns->count() == 3);
+
+        // a syntax error while preparing names its entry
+        pgsql::Pipeline $broken = $db->pipeline();
+        $broken->add('SELECT 1');
+        $broken->add('SELEC 2');
+        assert($broken->run()->failure()->is(.syntaxError));
+        assert(($broken->failedAt() ?? 99) == 1);
+        fine($db->ping());
+        did($db->exec('DROP TABLE pl'));
+    }
+}
+
+#[group: 'live']
+test live_pool_under_threads
+{
+    pgsql::PoolOptions $limits = pgsql::PoolOptions();
+    $limits->max = 8;
+    pgsql::Pool $pool = pgsql::Pool(liveOptions(), $limits);
+    did($pool->exec('DROP TABLE IF EXISTS hits; CREATE TABLE hits (t int, n int)'));
+    array<thread::handle> $threads = array<thread::handle>();
+    int32 $t = 0;
+    while ($t < 32) {
+        int32 $me = $t;
+        thread::handle $h = guard thread::spawn(function() : void {
+            int32 $k = 0;
+            while ($k < 50) {
+                guard $pool->exec('INSERT INTO hits VALUES (:t, :n)', ['t' => $me, 'n' => $k]) else ($e) {
+                    die("insert: {$e}");
+                }
+                $k = $k + 1;
+            }
+            guard $pool->transaction(function(pgsql::Connection $c) : status<pgsql::Error> {
+                guard $c->exec('UPDATE hits SET n = n + 1000 WHERE t = :t', ['t' => $me]) else ($e) {
+                    return .error($e);
+                }
+                return .ok;
+            }) else ($e) {
+                die("transaction: {$e}");
+            }
+        }) else ($e) {
+            die($e->message());
+        }
+        $threads->push($h);
+        $t = $t + 1;
+    }
+    foreach ($threads as $h) {
+        $h->join();
+    }
+    assert($pool->open() <= 8);
+    pgsql::ResultSet $rs = got($pool->query('SELECT count(*) AS n, min(n) AS lo FROM hits'));
+    assert(($rs[0]['n']->int() ?? 0) == 1600);
+    assert(($rs[0]['lo']->int() ?? 0) == 1000);
+
+    // a lease dropped in a failed transaction comes back rolled back
+    {
+        pgsql::Lease $l = guard $pool->acquire() else ($e) {
+            die("{$e}");
+        }
+        did($l->db()->exec('BEGIN'));
+        failsExec($l->db()->exec('SELECT 1/0'));
+        assert($l->db()->inTransaction());
+    }
+    pgsql::Lease $again = guard $pool->acquire() else ($e) {
+        die("{$e}");
+    }
+    assert(!$again->db()->inTransaction());
+    $again->release();
+    did($pool->exec('DROP TABLE hits'));
+    $pool->close();
+}
+
+#[end]

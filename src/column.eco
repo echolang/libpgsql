@@ -1,0 +1,236 @@
+namespace pgsql;
+
+/**
+ * A column's type, by its OID. The built-in types this library reads have names; every other
+ * type (an enum, a domain, a range, an extension's) is `other` and still carries its OID in
+ * `value()`.
+ */
+public enum PgType : uint32
+{
+    case bool = 16;
+    case bytea = 17;
+    case char = 18;
+    case name = 19;
+    case int8 = 20;
+    case int2 = 21;
+    case int4 = 23;
+    case text = 25;
+    case oid = 26;
+    case json = 114;
+    case float4 = 700;
+    case float8 = 701;
+    case unknown = 705;
+    case bpchar = 1042;
+    case varchar = 1043;
+    case date = 1082;
+    case time = 1083;
+    case timestamp = 1114;
+    case timestamptz = 1184;
+    case interval = 1186;
+    case timetz = 1266;
+    case numeric = 1700;
+    case uuid = 2950;
+    case jsonb = 3802;
+    case boolArray = 1000;
+    case byteaArray = 1001;
+    case int2Array = 1005;
+    case int4Array = 1007;
+    case textArray = 1009;
+    case varcharArray = 1015;
+    case int8Array = 1016;
+    case float4Array = 1021;
+    case float8Array = 1022;
+    case timestampArray = 1115;
+    case dateArray = 1182;
+    case timestamptzArray = 1185;
+    case numericArray = 1231;
+    case uuidArray = 2951;
+    case jsonbArray = 3807;
+
+    /**
+     * A type this library does not name. `value()` is its OID.
+     */
+    case other;
+}
+
+/**
+ * One column of a result, as the server described it.
+ */
+public struct Column
+{
+    /**
+     * Column name, as the server reported it. An alias, when the SQL used one; `?column?` for an
+     * expression without one.
+     */
+    public const string $name;
+
+    /**
+     * The OID of the table the column comes from. Zero for an expression.
+     */
+    public const uint32 $table;
+
+    /**
+     * The column's number in that table. Zero for an expression.
+     */
+    public const int16 $attribute;
+
+    public const PgType $type;
+
+    /**
+     * The type's size in bytes; negative for a variable-length type.
+     */
+    public const int16 $size;
+
+    /**
+     * The type modifier: `VARCHAR(40)`'s length, `NUMERIC(10,2)`'s precision. -1 for none.
+     */
+    public const int32 $modifier;
+
+    // 0 text, 1 binary: how its values travel in this result
+    internal const int16 $format;
+
+    /**
+     * True when values of this column arrive in binary.
+     */
+    public const function binary() : bool
+    {
+        return $this->format == pgsql::protocol::BINARY;
+    }
+
+    /**
+     * The same column, with values arriving in `$format`.
+     */
+    internal const function arriving(int16 $format) : Column
+    {
+        return Column($this->name, $this->table, $this->attribute, $this->type, $this->size, $this->modifier, $format);
+    }
+}
+
+// up to this many columns a name lookup scans `keys`; past it, `index` answers
+internal const usize SCAN_COLUMNS = 16;
+
+/**
+ * The columns of one result, shared by every row of it.
+ */
+public class Columns
+{
+    public const array<Column> $list;
+    private map<string, usize> $index;
+
+    // how each column's values are read, worked out once per result
+    internal array<pgsql::protocol::Shape> $shapes;
+    internal array<bool> $binary;
+    // each name's size and first bytes in one word; only for a result narrow enough to scan
+    private array<uint64> $keys;
+
+    public constructor(array<Column> $list)
+    {
+        usize $n = $list->count();
+        bool $scan = $n <= SCAN_COLUMNS;
+        $this->list = $list;
+        $this->index = map<string, usize>();
+        $this->shapes = arr::room<pgsql::protocol::Shape>($n);
+        $this->binary = arr::room<bool>($n);
+        $this->keys = array<uint64>();
+        if ($scan) {
+            $this->keys->reserve($n);
+        }
+        foreach ($list as $i => $c) {
+            if ($scan) {
+                $this->keys->push(key($c->name));
+            } else if (!$this->index->has($c->name)) {
+                // a join can return one name twice: the first one answers by name
+                $this->index[$c->name] = $i;
+            }
+            $this->shapes->push(pgsql::protocol::shape($c->type->value()));
+            $this->binary->push($c->binary());
+        }
+    }
+
+    public const function count() : usize
+    {
+        return $this->list->count();
+    }
+
+    /**
+     * Where the column called `$name` is, or null when the result has none.
+     */
+    public const function find(const string& $name) : usize?
+    {
+        usize $n = $this->list->count();
+        if ($n <= SCAN_COLUMNS) {
+            uint64 $k = key($name);
+            usize $i = 0;
+            while ($i < $n) {
+                // up to seven bytes the key is the whole name; past that, compare the rest
+                if ($this->keys[$i] == $k && ($name->size() <= 7 || $this->list[$i]->name == $name)) {
+                    usize? $found = $i;
+                    return $found;
+                }
+                $i = $i + 1;
+            }
+            return null;
+        }
+        if (!$this->index->has($name)) {
+            return null;
+        }
+        usize? $at = $this->index->get($name);
+        return $at;
+    }
+
+    public const function at(usize $i) : const Column&
+    {
+        return $this->list[$i];
+    }
+
+    public const function names() : array<string>
+    {
+        array<string> $out = arr::room<string>($this->list->count());
+        foreach ($this->list as $c) {
+            $out->push($c->name);
+        }
+        return $out;
+    }
+
+    /**
+     * The same columns, each arriving in binary when this library reads its type in binary. And
+     * the format codes a Bind asks for that with: none when all are text, one when all are
+     * binary.
+     */
+    internal const function chosen(array<int16>& $codes) : Columns
+    {
+        array<Column> $out = arr::room<Column>($this->list->count());
+        array<int16> $each = arr::room<int16>($this->list->count());
+        foreach ($this->list as const &$c) {
+            int16 $f = pgsql::protocol::TEXT;
+            if (pgsql::protocol::binary($c->type->value())) {
+                $f = pgsql::protocol::BINARY;
+            }
+            $out->push($c->arriving($f));
+            $each->push($f);
+        }
+        $codes = pgsql::protocol::formatCodes(mv $each);
+        return Columns(mv $out);
+    }
+}
+
+/**
+ * A column name in one word: size in the top byte, first seven bytes below. Equal keys of seven
+ * bytes or fewer are the same name. A size of 255 or more stores as 255, so two long names can
+ * share a key (they compare in full anyway) and a long one never matches a short one.
+ */
+internal function key(const string& $name) : uint64
+{
+    usize $n = $name->size();
+    usize $top = $n;
+    if ($top > 255) {
+        $top = 255;
+    }
+    uint64 $k = ($top as uint64) << 56;
+    usize $i = 0;
+    while ($i < $n && $i < 7) {
+        $k = $k | (($name->byte($i) as uint64) << (($i * 8) as uint64));
+        $i = $i + 1;
+    }
+    return $k;
+}

@@ -1,0 +1,1340 @@
+namespace pgsql;
+
+use std::time;
+use pgsql::protocol::{Message, Placeholders};
+
+/**
+ * How a result starts: with its columns (rows follow), done without rows, or the end of the
+ * command.
+ */
+internal enum Head
+{
+    case rows(Columns $columns);
+    case done(Outcome $outcome);
+    case end;
+}
+
+/**
+ * A statement the server holds: its name (empty for the unnamed one), the placeholder names, the
+ * parameter types the server inferred, its columns as they arrive, and the result formats a Bind
+ * asks for.
+ */
+internal struct Prepared
+{
+    internal string $name;
+    internal array<string> $names;
+    internal array<uint32> $types;
+    internal Columns $columns;
+    internal array<int16> $formats;
+}
+
+/**
+ * A statement in the cache, with when it was last used.
+ */
+internal struct Cached
+{
+    internal Prepared $p;
+    internal uint64 $used;
+}
+
+/**
+ * How strictly a transaction is isolated from the others. PostgreSQL runs READ UNCOMMITTED as
+ * READ COMMITTED.
+ */
+public enum Isolation
+{
+    case readCommitted;
+    case repeatableRead;
+    case serializable;
+
+    internal const function sql() : string
+    {
+        return match ($this) {
+            Isolation::readCommitted => 'READ COMMITTED',
+            Isolation::repeatableRead => 'REPEATABLE READ',
+            Isolation::serializable => 'SERIALIZABLE',
+        };
+    }
+}
+
+#[docs::groups: ["Opening", "Queries", "Statements", "Bulk", "Transactions", "Session"]]
+#[docs::see: ["pgsql::Pool", "pgsql::Statement"]]
+
+/**
+ * One session with a PostgreSQL server. Use it from one thread at a time (`cancel` aside).
+ * `#[atomic]` so a pool can hand it from one thread to the next.
+ *
+ * Statements with values, and every query that returns rows, run as prepared statements the
+ * connection keeps (`Options->statementCache`): the first run of a SQL string prepares it, every
+ * later run is one round trip, with rows in binary where that is cheaper to read.
+ *
+ * ```echo
+ * pgsql::Connection $db = guard
+ *     pgsql::Connection::open($url);
+ * echo $db->server;           // 18.1
+ * ```
+ */
+#[atomic]
+public class Connection
+{
+    /**
+     * The server's version, as it reports it (`server_version`).
+     */
+    #[docs::group: "Session"]
+    public const string $server;
+
+    /**
+     * What a cancel request for this session has to show. `pgsql::cancel` takes it, from any
+     * thread.
+     */
+    #[docs::group: "Session"]
+    public const CancelKey $key;
+
+    internal Channel $channel;
+    internal Options $options;
+    internal uint32 $protocol;
+    // the transaction status of the last ReadyForQuery: I, T or E
+    internal uint8 $status;
+    internal bool $busy;
+    // a command was sent and its ReadyForQuery has not been read
+    internal bool $pending;
+    // how the last result ended
+    internal Outcome $ending;
+    private map<string, Cached> $cache;
+    private uint64 $tick;
+    private uint64 $serial;
+    // statements to close on the server, sent ahead of the next command
+    internal array<string> $closing;
+    // the columns of every result without rows, made once
+    internal Columns $none;
+
+    internal constructor(Channel $channel, Options $options, Session $s)
+    {
+        $this->server = $channel->setting('server_version') ?? '';
+        $this->key = $s->key;
+        $this->channel = $channel;
+        $this->options = $options;
+        $this->protocol = $s->protocol;
+        $this->status = $s->status;
+        $this->busy = false;
+        $this->pending = false;
+        $this->ending = Outcome();
+        $this->cache = map<string, Cached>();
+        $this->tick = 0;
+        $this->serial = 0;
+        $this->closing = array<string>();
+        $this->none = Columns(array<Column>());
+    }
+
+    destructor()
+    {
+        if ($this->channel->alive() && !$this->busy) {
+            $this->quit(tcp::Deadline(ms: 1000));
+        }
+    }
+
+    /**
+     * Connect to the server a URL names: `postgres://user:password@host:port/database?...`.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const string& $url) : result<Connection, Error>
+    {
+        Options $o = guard Options::parse($url) else ($e) {
+            return .error($e);
+        }
+        return Connection::open($o);
+    }
+
+    /**
+     * Connect and log in, all within `connectTimeout`.
+     */
+    #[docs::group: "Opening"]
+    public static function open(const Options& $o) : result<Connection, Error>
+    {
+        if ($o->sslmode->needsTls()) {
+            return .error(.invalid('this client has no TLS yet: sslmode require, verify-ca and verify-full cannot be met'));
+        }
+        tcp::Deadline $by = tcp::Deadline(after: $o->connectTimeout);
+        tcp::Stream $stream = guard dial($o, $by) else ($e) {
+            return .error($e);
+        }
+        Channel $ch = Channel($stream, $o->maxMessage);
+        Login $login = Login($ch, $o, $by);
+        Session $s = guard $login->run() else ($e) {
+            $ch->close();
+            return .error($e);
+        }
+        return .ok(Connection($ch, $o, $s));
+    }
+
+    /**
+     * True when the socket is still open. Does not talk to the server; `ping` does.
+     */
+    #[docs::group: "Session"]
+    public const function alive() : bool
+    {
+        return $this->channel->alive();
+    }
+
+    /**
+     * True when a transaction is open, by the server's own account after the last command.
+     */
+    #[docs::group: "Transactions"]
+    public const function inTransaction() : bool
+    {
+        return $this->status != pgsql::protocol::IDLE;
+    }
+
+    /**
+     * A run-time parameter the server reports and keeps current: `server_version`,
+     * `server_encoding`, `TimeZone`, `DateStyle`, `integer_datetimes`,
+     * `standard_conforming_strings`, `application_name`, `is_superuser`. Null for one it has not
+     * reported.
+     */
+    #[docs::group: "Session"]
+    public const function setting(const string& $name) : string?
+    {
+        return $this->channel->setting($name);
+    }
+
+    /**
+     * Hear about notices and warnings the server sends (`RAISE NOTICE`, a deprecation). Without a
+     * hook they are dropped.
+     */
+    #[docs::group: "Session"]
+    public function onNotice(function<void(ServerError)> $hook) : void
+    {
+        $this->channel->onNotice = $hook;
+    }
+
+    // query: the whole result, read into memory
+
+    /**
+     * Run `$sql` and read the whole result.
+     */
+    #[docs::group: "Queries"]
+    public function query(const string& $sql, by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        return $this->fetch($sql, Params(), $by);
+    }
+
+    /**
+     * Run `$sql` with `$params` and read the whole result.
+     */
+    #[docs::group: "Queries"]
+    public function query(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        return $this->fetch($sql, $params, $by);
+    }
+
+    // exec: what a statement did
+
+    /**
+     * Run `$sql`, which may be several statements, and return what the last one did. No values,
+     * so the simple protocol: one round trip, nothing prepared.
+     */
+    #[docs::group: "Queries"]
+    public function exec(const string& $sql, by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        guard $this->simple($sql, $until) else ($e) {
+            return .error($e);
+        }
+        Outcome $last = Outcome();
+        while ($this->pending) {
+            Head $h = guard $this->head(null, $until) else ($e) {
+                return .error($e);
+            }
+            match ($h) {
+                Head::end => {},
+                else => {
+                    Outcome $o = guard $this->ended($h, $until) else ($e) {
+                        return .error($e);
+                    }
+                    $last = $o;
+                },
+            }
+        }
+        return .ok($last->settled($this->status));
+    }
+
+    /**
+     * Run `$sql` with `$params` and return what it did. A prepared statement, cached.
+     */
+    #[docs::group: "Queries"]
+    public function exec(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        Head $h = guard $this->start($sql, $params, $until) else ($e) {
+            return .error($e);
+        }
+        return $this->outcome($h, $until);
+    }
+
+    // stream: rows one at a time, without buffering the result
+
+    /**
+     * Run `$sql` and read rows one at a time.
+     */
+    #[docs::group: "Queries"]
+    public function stream(const string& $sql, by: tcp::Deadline? $by = null) : result<Rows, Error>
+    {
+        return $this->open($sql, Params(), $by);
+    }
+
+    /**
+     * Run `$sql` with `$params` and read rows one at a time.
+     */
+    #[docs::group: "Queries"]
+    public function stream(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<Rows, Error>
+    {
+        return $this->open($sql, $params, $by);
+    }
+
+    /**
+     * Every result of a script of several statements, in order. No values, so the simple
+     * protocol, and rows arrive as text.
+     */
+    #[docs::group: "Queries"]
+    public function batch(const string& $sql, by: tcp::Deadline? $by = null) : result<array<ResultSet>, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        guard $this->simple($sql, $until) else ($e) {
+            return .error($e);
+        }
+        array<ResultSet> $sets = array<ResultSet>();
+        while ($this->pending) {
+            Head $h = guard $this->head(null, $until) else ($e) {
+                return .error($e);
+            }
+            match ($h) {
+                Head::end => {},
+                else => {
+                    ResultSet $rs = guard $this->collect($h, $until) else ($e) {
+                        return .error($e);
+                    }
+                    $sets->push(mv $rs);
+                },
+            }
+        }
+        return .ok($this->settled($sets));
+    }
+
+    /**
+     * A statement prepared on the server, to run many times. Its own, outside the cache.
+     */
+    #[docs::group: "Statements"]
+    public function prepare(const string& $sql, by: tcp::Deadline? $by = null) : result<Statement, Error>
+    {
+        Prepared $p = guard $this->describe($sql, $this->nextName('p'), $this->deadline($by)) else ($e) {
+            return .error($e);
+        }
+        return .ok(Statement($this, $p));
+    }
+
+    // bulk
+
+    /**
+     * Start a `COPY ... FROM STDIN`. The rows go through the `CopyIn`; the connection is busy
+     * until it finishes. The deadline covers the whole COPY.
+     */
+    #[docs::group: "Bulk"]
+    public function copyIn(const string& $sql, by: tcp::Deadline? $by = null) : result<CopyIn, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        pgsql::protocol::CopyFormat $f = guard $this->copying($sql, pgsql::protocol::COPY_IN, $until) else ($e) {
+            return .error($e);
+        }
+        return .ok(CopyIn($this, $until, $f->format == pgsql::protocol::BINARY, array<uint32>()));
+    }
+
+    /**
+     * Start a binary `COPY $table ($columns) FROM STDIN`: `row` encodes each value for its
+     * column's type, which the server is asked first (once, through the statement cache). The
+     * fastest way in for many rows. A table with a column this library has no binary form for
+     * (NUMERIC, an enum) is copied in the text format instead. Names are SQL as written: quote
+     * one that needs it.
+     */
+    #[docs::group: "Bulk"]
+    public function copyIn(table: const string& $table, array<string> $columns, by: tcp::Deadline? $by = null) : result<CopyIn, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        string $list = str::join($columns, ', ');
+        Prepared $p = guard $this->prepared("SELECT {$list} FROM {$table} LIMIT 0", $until) else ($e) {
+            return .error($e);
+        }
+        array<uint32> $types = arr::room<uint32>($p->columns->count());
+        bool $binary = true;
+        foreach ($p->columns->list as const &$c) {
+            uint32 $oid = $c->type->value();
+            if (!pgsql::protocol::binary($oid)) {
+                $binary = false;
+            }
+            $types->push($oid);
+        }
+        string $sql = "COPY {$table} ({$list}) FROM STDIN";
+        if ($binary) {
+            $sql->append(' (FORMAT binary)');
+        } else {
+            $types->clear();
+        }
+        pgsql::protocol::CopyFormat $f = guard $this->copying($sql, pgsql::protocol::COPY_IN, $until) else ($e) {
+            return .error($e);
+        }
+        return .ok(CopyIn($this, $until, $f->format == pgsql::protocol::BINARY, $types));
+    }
+
+    /**
+     * Start a `COPY ... TO STDOUT`. The data comes through the `CopyOut`; the connection is busy
+     * until it is read. The deadline covers the whole COPY.
+     */
+    #[docs::group: "Bulk"]
+    public function copyOut(const string& $sql, by: tcp::Deadline? $by = null) : result<CopyOut, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        pgsql::protocol::CopyFormat $f = guard $this->copying($sql, pgsql::protocol::COPY_OUT, $until) else ($e) {
+            return .error($e);
+        }
+        return .ok(CopyOut($this, $until, $f->format == pgsql::protocol::BINARY));
+    }
+
+    /**
+     * Statements run in one round trip, see `Pipeline`.
+     */
+    #[docs::group: "Bulk"]
+    public function pipeline() : Pipeline
+    {
+        return Pipeline($this);
+    }
+
+    /**
+     * Send `$sql` and read on to the response that starts the COPY, `$want`.
+     */
+    private function copying(const string& $sql, uint8 $want, tcp::Deadline $by) : result<pgsql::protocol::CopyFormat, Error>
+    {
+        guard $this->simple($sql, $by) else ($e) {
+            return .error($e);
+        }
+        Message $m = guard $this->channel->next($by) else ($e) {
+            return .error($this->interrupted($e));
+        }
+        if ($m->type == $want) {
+            pgsql::protocol::CopyFormat $f = guard pgsql::protocol::copyFormat($m->body) else ($e) {
+                return .error($this->broken($e));
+            }
+            return .ok($f);
+        }
+        if ($m->type == pgsql::protocol::ERROR) {
+            return .error($this->refused($m, $by));
+        }
+        if ($m->type == pgsql::protocol::COPY_IN) {
+            pgsql::protocol::copyFail($this->channel->out, 'a COPY FROM STDIN where TO STDOUT was asked for');
+            guard $this->channel->send($by) else ($e) {
+                return .error($e);
+            }
+        }
+        // something else ran: read it away
+        guard $this->settle($by) else ($e) {
+            return .error(.invalid('not a COPY in the expected direction'));
+        }
+        return .error(.invalid('not a COPY in the expected direction'));
+    }
+
+    // transactions
+
+    /**
+     * Start a transaction. Dropping the `Transaction` without `commit()` rolls it back.
+     */
+    #[docs::group: "Transactions"]
+    public function begin(by: tcp::Deadline? $by = null) : result<Transaction, Error>
+    {
+        guard $this->exec('BEGIN', by: $by) else ($e) {
+            return .error($e);
+        }
+        return .ok(Transaction($this));
+    }
+
+    /**
+     * Start a transaction at `$isolation`, read-only when asked.
+     */
+    #[docs::group: "Transactions"]
+    public function begin(Isolation $isolation, bool $readOnly = false, by: tcp::Deadline? $by = null) : result<Transaction, Error>
+    {
+        string $sql = 'BEGIN ISOLATION LEVEL ';
+        $sql->append($isolation->sql());
+        if ($readOnly) {
+            $sql->append(' READ ONLY');
+        }
+        guard $this->exec($sql, by: $by) else ($e) {
+            return .error($e);
+        }
+        return .ok(Transaction($this));
+    }
+
+    /**
+     * Run `$work` in a transaction: commit on ok, roll back on error (and hand that error on).
+     */
+    #[docs::group: "Transactions"]
+    public function transaction(function<status<Error>(Connection)> $work, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        guard $this->transact<bool>(function(Connection $c) : result<bool, Error> {
+            guard $work($c) else ($e) {
+                return .error($e);
+            }
+            return .ok(true);
+        }, $by) else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    }
+
+    /**
+     * Run `$work` in a transaction and hand back its value: commit on ok, roll back on error.
+     */
+    #[docs::group: "Transactions"]
+    public function transaction<T>(function<result<T, Error>(Connection)> $work, by: tcp::Deadline? $by = null) : result<T, Error>
+    {
+        return $this->transact<T>($work, $by);
+    }
+
+    /**
+     * What `transaction<T>` does, under its own name. A generic body that calls an overloaded
+     * generic method by type parameter hits the non-generic overload, so `Pool` calls this one.
+     */
+    internal function transact<T>(function<result<T, Error>(Connection)> $work, tcp::Deadline? $by) : result<T, Error>
+    {
+        Transaction $tx = guard $this->begin(by: $by) else ($e) {
+            return .error($e);
+        }
+        result<T, Error> $done = $work($this);
+        if ($done->failed()) {
+            Error $why = $done->failure();
+            $tx->rollback(by: $by);
+            return .error($why);
+        }
+        guard $tx->commit(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $done;
+    }
+
+    // the session
+
+    /**
+     * Check that the server is still there: one round trip, nothing parsed.
+     */
+    #[docs::group: "Session"]
+    public function ping(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        guard $this->opening() else ($e) {
+            return .error($e);
+        }
+        tcp::Deadline $until = $this->deadline($by);
+        pgsql::protocol::sync($this->channel->out);
+        guard $this->sent($until) else ($e) {
+            return .error($e);
+        }
+        return $this->settle($until);
+    }
+
+    /**
+     * Reset the session (`DISCARD ALL`): roll back, drop temporary tables, prepared statements and
+     * session settings. As if newly connected, without logging in again. Statements from
+     * `prepare` are gone with it.
+     */
+    #[docs::group: "Session"]
+    public function reset(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        if ($this->inTransaction()) {
+            guard $this->exec('ROLLBACK', by: $by) else ($e) {
+                return .error($e);
+            }
+        }
+        guard $this->exec('DISCARD ALL', by: $by) else ($e) {
+            return .error($e);
+        }
+        $this->cache->clear();
+        $this->closing->clear();
+        return .ok;
+    }
+
+    /**
+     * Ask the server to cancel what this session is running, over a connection of its own.
+     */
+    #[docs::group: "Session"]
+    public const function cancel(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        return pgsql::cancel($this->options, $this->key, by: $by);
+    }
+
+    /**
+     * Say goodbye and close. Safe to call twice.
+     */
+    #[docs::group: "Session"]
+    public function close() : void
+    {
+        if ($this->channel->alive()) {
+            $this->quit(tcp::Deadline(ms: 1000));
+        }
+        $this->channel->close();
+    }
+
+    // the plumbing below
+
+    private function quit(tcp::Deadline $by) : void
+    {
+        $this->channel->out->clear();
+        pgsql::protocol::terminate($this->channel->out);
+        status<Error> $sent = $this->channel->send($by);
+        $this->channel->finish($by);
+    }
+
+    /**
+     * The call's deadline: the one it named, else `Options->timeout` from now, else never.
+     */
+    internal const function deadline(tcp::Deadline? $by) : tcp::Deadline
+    {
+        tcp::Deadline $given = guard $by else {
+            time::duration $t = guard $this->options->timeout else {
+                return tcp::Deadline::never();
+            }
+            return tcp::Deadline(after: $t);
+        }
+        return $given;
+    }
+
+    /**
+     * Whether a command may start now. When it may, the statements waiting to be closed go out
+     * ahead of it.
+     */
+    internal function opening() : status<Error>
+    {
+        if ($this->busy) {
+            return .error(.busy);
+        }
+        if (!$this->channel->alive()) {
+            return .error(.closed);
+        }
+        foreach ($this->closing as const &$name) {
+            pgsql::protocol::close($this->channel->out, pgsql::protocol::STATEMENT, $name);
+        }
+        $this->closing->clear();
+        return .ok;
+    }
+
+    /**
+     * Send what the command wrote. From here its ReadyForQuery is due.
+     */
+    internal function sent(tcp::Deadline $by) : status<Error>
+    {
+        guard $this->channel->send($by) else ($e) {
+            return .error($e);
+        }
+        $this->pending = true;
+        return .ok;
+    }
+
+    /**
+     * A simple Query: one or more statements, no values.
+     */
+    private function simple(const string& $sql, tcp::Deadline $by) : status<Error>
+    {
+        guard $this->opening() else ($e) {
+            return .error($e);
+        }
+        pgsql::protocol::query($this->channel->out, $sql);
+        return $this->sent($by);
+    }
+
+    private function fetch(const string& $sql, const Params& $params, tcp::Deadline? $by) : result<ResultSet, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        Head $h = guard $this->start($sql, $params, $until) else ($e) {
+            return .error($e);
+        }
+        return $this->whole($h, $until);
+    }
+
+    private function open(const string& $sql, const Params& $params, tcp::Deadline? $by) : result<Rows, Error>
+    {
+        tcp::Deadline $until = $this->deadline($by);
+        Head $h = guard $this->start($sql, $params, $until) else ($e) {
+            return .error($e);
+        }
+        return $this->rows($h, $until);
+    }
+
+    /**
+     * The result a command's head starts, read whole, and the command read to its end.
+     */
+    internal function whole(const Head& $h, tcp::Deadline $by) : result<ResultSet, Error>
+    {
+        ResultSet $rs = guard $this->collect($h, $by) else ($e) {
+            return .error($e);
+        }
+        guard $this->drain($by) else ($e) {
+            return .error($e);
+        }
+        return .ok(ResultSet($rs->columns, mv $rs->rows, $rs->outcome->settled($this->status)));
+    }
+
+    /**
+     * `$sets`, collected before the command ended, with the transaction status it ended with.
+     */
+    internal const function settled(const array<ResultSet>& $sets) : array<ResultSet>
+    {
+        array<ResultSet> $out = arr::room<ResultSet>($sets->count());
+        foreach ($sets as const &$rs) {
+            $out->push(ResultSet($rs->columns, $rs->rows, $rs->outcome->settled($this->status)));
+        }
+        return $out;
+    }
+
+    /**
+     * How the result a command's head starts ended, its rows dropped unread, and the command read
+     * to its end.
+     */
+    internal function outcome(const Head& $h, tcp::Deadline $by) : result<Outcome, Error>
+    {
+        Outcome $o = guard $this->ended($h, $by) else ($e) {
+            return .error($e);
+        }
+        guard $this->drain($by) else ($e) {
+            return .error($e);
+        }
+        return .ok($o->settled($this->status));
+    }
+
+    /**
+     * How the result a command's head starts ended, its rows dropped unread.
+     */
+    private function ended(const Head& $h, tcp::Deadline $by) : result<Outcome, Error>
+    {
+        match ($h) {
+            Head::rows($c) => {
+                guard $this->skip($by) else ($e) {
+                    return .error($e);
+                }
+                return .ok($this->ending);
+            },
+            Head::done($o) => {
+                return .ok($o);
+            },
+            Head::end => {
+                return .ok(Outcome());
+            },
+        }
+    }
+
+    /**
+     * The rows a command's head starts, as a stream.
+     */
+    internal function rows(const Head& $h, tcp::Deadline $by) : result<Rows, Error>
+    {
+        match ($h) {
+            Head::rows($c) => {
+                return .ok(Rows($this, $c, $by, true));
+            },
+            else => {
+                guard $this->drain($by) else ($e) {
+                    return .error($e);
+                }
+                return .ok(Rows($this, $this->none, $by, false));
+            },
+        }
+    }
+
+    /**
+     * Send `$sql` with `$params` and read the head of its answer. A statement the server no longer
+     * holds, or whose result changed shape under a schema change, is prepared again and run once
+     * more, outside a transaction.
+     */
+    internal function start(const string& $sql, const Params& $params, tcp::Deadline $by) : result<Head, Error>
+    {
+        if ($this->options->statementCache == 0) {
+            guard $this->unnamed($sql, $params, $by) else ($e) {
+                return .error($e);
+            }
+            return $this->head(null, $by);
+        }
+        int32 $attempt = 0;
+        while (true) {
+            Prepared $st = guard $this->prepared($sql, $by) else ($e) {
+                return .error($e);
+            }
+            result<Head, Error> $h = $this->run($st, $params, $by);
+            if ($h->failed() && $attempt == 0 && !$this->inTransaction() && stale($h->failure())) {
+                $this->forget($sql);
+                $attempt = 1;
+                continue;
+            }
+            return $h;
+        }
+    }
+
+    /**
+     * Run statement `$st` with `$params` and read the head of its answer.
+     */
+    internal function run(const Prepared& $st, const Params& $params, tcp::Deadline $by) : result<Head, Error>
+    {
+        guard $this->bind($st, $params, $by) else ($e) {
+            return .error($e);
+        }
+        Columns? $described = $st->columns;
+        return $this->head($described, $by);
+    }
+
+    /**
+     * Bind, Execute and Sync for `$st`, in one write.
+     */
+    internal function bind(const Prepared& $st, const Params& $params, tcp::Deadline $by) : status<Error>
+    {
+        guard $this->opening() else ($e) {
+            return .error($e);
+        }
+        guard $this->writeBind($st, $params) else ($e) {
+            return .error($e);
+        }
+        pgsql::protocol::sync($this->channel->out);
+        return $this->sent($by);
+    }
+
+    /**
+     * The unnamed statement: Parse, Bind, Describe, Execute and Sync in one write. Values travel
+     * as text, rows come back as text.
+     */
+    private function unnamed(const string& $sql, const Params& $params, tcp::Deadline $by) : status<Error>
+    {
+        guard $this->opening() else ($e) {
+            return .error($e);
+        }
+        guard $this->writeUnnamed($sql, $params) else ($e) {
+            return .error($e);
+        }
+        pgsql::protocol::sync($this->channel->out);
+        return $this->sent($by);
+    }
+
+    /**
+     * Write Bind and Execute for `$st`, no Sync.
+     */
+    internal function writeBind(const Prepared& $st, const Params& $params) : status<Error>
+    {
+        array<Value> $values = guard $params->resolve($st->names, $st->types->count()) else ($e) {
+            return .error($e);
+        }
+        string $encoded = '';
+        array<int16> $formats = array<int16>();
+        guard encodeAll($values, $st->types, $encoded, $formats) else ($e) {
+            return .error($e);
+        }
+        pgsql::protocol::bind($this->channel->out, '', $st->name, $formats, $values->count(), $encoded, $st->formats);
+        pgsql::protocol::execute($this->channel->out, '', 0);
+        return .ok;
+    }
+
+    /**
+     * Write Parse, Bind, Describe and Execute for `$sql` as the unnamed statement, no Sync.
+     */
+    internal function writeUnnamed(const string& $sql, const Params& $params) : status<Error>
+    {
+        Placeholders $ph = guard pgsql::protocol::placeholders($sql) else ($e) {
+            return .error($e);
+        }
+        array<Value> $values = guard $params->resolve($ph->names, $ph->count) else ($e) {
+            return .error($e);
+        }
+        array<uint32> $unknown = array<uint32>();
+        string $encoded = '';
+        array<int16> $formats = array<int16>();
+        guard encodeAll($values, $unknown, $encoded, $formats) else ($e) {
+            return .error($e);
+        }
+        array<int16> $text = array<int16>();
+        pgsql::protocol::parse($this->channel->out, '', $ph->sql, $unknown);
+        pgsql::protocol::bind($this->channel->out, '', '', $formats, $values->count(), $encoded, $text);
+        pgsql::protocol::describe($this->channel->out, pgsql::protocol::PORTAL, '');
+        pgsql::protocol::execute($this->channel->out, '', 0);
+        return .ok;
+    }
+
+    /**
+     * The cached statement for `$sql`, or one prepared now. A full cache gives up the statement
+     * used longest ago.
+     */
+    internal function prepared(const string& $sql, tcp::Deadline $by) : result<Prepared, Error>
+    {
+        Prepared? $hit = $this->cached($sql);
+        if ($hit != null) {
+            Prepared $known = guard $hit;
+            return .ok($known);
+        }
+        Prepared $p = guard $this->describe($sql, $this->nextName('s'), $by) else ($e) {
+            return .error($e);
+        }
+        $this->remember($sql, $p);
+        return .ok($p);
+    }
+
+    /**
+     * Keep `$p` for `$sql`. A full cache gives up the statement used longest ago.
+     */
+    internal function remember(const string& $sql, const Prepared& $p) : void
+    {
+        if ($this->cache->count() >= $this->options->statementCache) {
+            string $oldest = '';
+            uint64 $when = 18446744073709551615;
+            foreach ($this->cache as $k => const &$c) {
+                if ($c->used < $when) {
+                    $when = $c->used;
+                    $oldest = $k;
+                }
+            }
+            $this->forget($oldest);
+        }
+        $this->tick = $this->tick + 1;
+        $this->cache[$sql] = Cached($p, $this->tick);
+    }
+
+    /**
+     * The cached statement for `$sql`, or null.
+     */
+    internal function cached(const string& $sql) : Prepared?
+    {
+        if (!$this->cache->has($sql)) {
+            return null;
+        }
+        $this->tick = $this->tick + 1;
+        Cached& $c = $this->cache->at($sql);
+        $c->used = $this->tick;
+        return $c->p;
+    }
+
+    /**
+     * A name for the next statement prepared on the server.
+     */
+    internal function nextName(const string& $prefix) : string
+    {
+        $this->serial = $this->serial + 1;
+        return "{$prefix}{$this->serial}";
+    }
+
+    /**
+     * Drop `$sql` from the cache, its statement closed ahead of the next command.
+     */
+    internal function forget(const string& $sql) : void
+    {
+        if (!$this->cache->has($sql)) {
+            return;
+        }
+        Cached $gone = $this->cache->take($sql);
+        $this->closing->push($gone->p->name);
+    }
+
+    /**
+     * Parse `$sql` into statement `$name` and describe it: one round trip. Named placeholders are
+     * rewritten first.
+     */
+    internal function describe(const string& $sql, const string& $name, tcp::Deadline $by) : result<Prepared, Error>
+    {
+        guard $this->opening() else ($e) {
+            return .error($e);
+        }
+        Placeholders $ph = guard $this->parse($sql, $name) else ($e) {
+            return .error($e);
+        }
+        pgsql::protocol::sync($this->channel->out);
+        guard $this->sent($by) else ($e) {
+            return .error($e);
+        }
+        Prepared $p = guard $this->described($name, $ph, $by) else ($e) {
+            return .error($e);
+        }
+        guard $this->settle($by) else ($e) {
+            return .error($e);
+        }
+        return .ok($p);
+    }
+
+    /**
+     * Write Parse and Describe for `$sql` as statement `$name`, placeholders rewritten.
+     */
+    internal function parse(const string& $sql, const string& $name) : result<Placeholders, Error>
+    {
+        Placeholders $ph = guard pgsql::protocol::placeholders($sql) else ($e) {
+            return .error($e);
+        }
+        array<uint32> $none = array<uint32>();
+        pgsql::protocol::parse($this->channel->out, $name, $ph->sql, $none);
+        pgsql::protocol::describe($this->channel->out, pgsql::protocol::STATEMENT, $name);
+        return .ok($ph);
+    }
+
+    /**
+     * Read what a Parse and Describe of statement `$name` answer: its parameter types and its
+     * columns. An error reads on to the end of the command.
+     */
+    internal function described(const string& $name, const Placeholders& $ph, tcp::Deadline $by) : result<Prepared, Error>
+    {
+        array<uint32> $types = array<uint32>();
+        while (true) {
+            Message $m = guard $this->channel->next($by) else ($e) {
+                return .error($this->interrupted($e));
+            }
+            uint8 $t = $m->type;
+            Columns? $columns = null;
+            if ($t == pgsql::protocol::PARAMETER_DESCRIPTION) {
+                array<uint32> $got = guard pgsql::protocol::parameterDescription($m->body) else ($e) {
+                    return .error($this->broken($e));
+                }
+                $types = mv $got;
+                continue;
+            } else if ($t == pgsql::protocol::ROW_DESCRIPTION) {
+                Columns $cols = guard pgsql::protocol::rowDescription($m->body) else ($e) {
+                    return .error($this->broken($e));
+                }
+                $columns = $cols;
+            } else if ($t == pgsql::protocol::NO_DATA) {
+                $columns = $this->none;
+            } else if ($t == pgsql::protocol::ERROR) {
+                return .error($this->refused($m, $by));
+            } else if ($t == pgsql::protocol::PARSE_COMPLETE || $t == pgsql::protocol::CLOSE_COMPLETE) {
+                continue;
+            } else {
+                return .error($this->broken(.malformed("message {$t} in a statement's description")));
+            }
+            Columns $found = guard $columns;
+            if (!$ph->names->empty() && $ph->names->count() != $types->count()) {
+                status<Error> $rest = $this->settle($by);
+                return .error(.invalid("the server counts {$types->count()} parameters, the SQL names {$ph->names->count()}"));
+            }
+            array<int16> $formats = array<int16>();
+            Columns $chosen = $found->chosen($formats);
+            return .ok(Prepared($name, $ph->names, $types, $chosen, $formats));
+        }
+    }
+
+    /**
+     * The start of the next result of the command in flight: its columns (`$described` when the
+     * statement was described before), done without rows, or the end of the command. A server
+     * error reads on to the end, so the connection is ready again when the caller hears of it.
+     */
+    internal function head(Columns? $described, tcp::Deadline $by) : result<Head, Error>
+    {
+        while (true) {
+            Message $m = guard $this->channel->next($by) else ($e) {
+                return .error($this->interrupted($e));
+            }
+            uint8 $t = $m->type;
+            if ($t == pgsql::protocol::BIND_COMPLETE) {
+                if ($described != null) {
+                    Columns $c = guard $described;
+                    if ($c->count() > 0) {
+                        return .ok(.rows($c));
+                    }
+                }
+                continue;
+            }
+            if ($t == pgsql::protocol::ROW_DESCRIPTION) {
+                Columns $cols = guard pgsql::protocol::rowDescription($m->body) else ($e) {
+                    return .error($this->broken($e));
+                }
+                return .ok(.rows($cols));
+            }
+            if ($t == pgsql::protocol::COMMAND_COMPLETE) {
+                Outcome $o = guard pgsql::protocol::complete($m->body) else ($e) {
+                    return .error($this->broken($e));
+                }
+                $this->ending = $o;
+                return .ok(.done($o));
+            }
+            if ($t == pgsql::protocol::EMPTY_QUERY) {
+                $this->ending = Outcome();
+                return .ok(.done($this->ending));
+            }
+            if ($t == pgsql::protocol::ERROR) {
+                return .error($this->refused($m, $by));
+            }
+            if ($t == pgsql::protocol::READY) {
+                guard $this->ready($m) else ($e) {
+                    return .error($e);
+                }
+                return .ok(Head::end);
+            }
+            if ($t == pgsql::protocol::COPY_IN) {
+                // a COPY FROM STDIN sent as a query: refused, the server answers with an error
+                pgsql::protocol::copyFail($this->channel->out, 'COPY FROM STDIN runs through Connection::copyIn()');
+                guard $this->channel->send($by) else ($e) {
+                    return .error($e);
+                }
+                continue;
+            }
+            if ($t == pgsql::protocol::PARSE_COMPLETE || $t == pgsql::protocol::CLOSE_COMPLETE || $t == pgsql::protocol::NO_DATA || $t == pgsql::protocol::COPY_OUT || $t == pgsql::protocol::COPY_DATA || $t == pgsql::protocol::COPY_DONE) {
+                // a COPY TO STDOUT sent as a query has its data dropped
+                continue;
+            }
+            return .error($this->broken(.malformed("message {$t} where a result was due")));
+        }
+    }
+
+    /**
+     * The next row of the result in flight, undecoded and in place, or null at its end (`ending`
+     * holds how it ended). The view holds until the next read on this connection.
+     */
+    internal function packet(tcp::Deadline $by) : result<string::view?, Error>
+    {
+        Message $m = guard $this->channel->next($by) else ($e) {
+            return .error($this->interrupted($e));
+        }
+        uint8 $t = $m->type;
+        if ($t == pgsql::protocol::DATA_ROW) {
+            string::view? $row = $m->body;
+            return .ok($row);
+        }
+        string::view? $end = null;
+        if ($t == pgsql::protocol::COMMAND_COMPLETE) {
+            Outcome $o = guard pgsql::protocol::complete($m->body) else ($e) {
+                return .error($this->broken($e));
+            }
+            $this->ending = $o;
+            return .ok($end);
+        }
+        if ($t == pgsql::protocol::PORTAL_SUSPENDED) {
+            return .ok($end);
+        }
+        if ($t == pgsql::protocol::ERROR) {
+            return .error($this->refused($m, $by));
+        }
+        return .error($this->broken(.malformed("message {$t} where a row was due")));
+    }
+
+    /**
+     * One result, read whole, from its head.
+     */
+    internal function collect(const Head& $h, tcp::Deadline $by) : result<ResultSet, Error>
+    {
+        match ($h) {
+            Head::rows($c) => {
+                Columns $columns = $c;
+                array<Row> $rows = array<Row>();
+                while (true) {
+                    string::view? $next = guard $this->packet($by) else ($e) {
+                        return .error($e);
+                    }
+                    string::view $p = guard $next else {
+                        break;
+                    }
+                    Row $row = guard Row::read($p, $columns) else ($e) {
+                        $this->abandon($e);
+                        return .error($e);
+                    }
+                    $rows->push(mv $row);
+                }
+                return .ok(ResultSet($columns, mv $rows, $this->ending));
+            },
+            Head::done($o) => {
+                return .ok(ResultSet($this->none, array<Row>(), $o));
+            },
+            Head::end => {
+                return .ok(ResultSet($this->none, array<Row>(), Outcome()));
+            },
+        }
+    }
+
+    /**
+     * Drop the rest of the result in flight, row by row, nothing decoded.
+     */
+    internal function skip(tcp::Deadline $by) : status<Error>
+    {
+        while (true) {
+            if ($this->channel->row() != null) {
+                continue;
+            }
+            string::view? $next = guard $this->packet($by) else ($e) {
+                return .error($e);
+            }
+            if ($next == null) {
+                return .ok;
+            }
+        }
+    }
+
+    /**
+     * Read the command in flight to its end, dropping any results left.
+     */
+    internal function drain(tcp::Deadline $by) : status<Error>
+    {
+        while ($this->pending) {
+            Head $h = guard $this->head(null, $by) else ($e) {
+                return .error($e);
+            }
+            match ($h) {
+                Head::rows($c) => {
+                    guard $this->skip($by) else ($e) {
+                        return .error($e);
+                    }
+                },
+                else => {},
+            }
+        }
+        return .ok;
+    }
+
+    /**
+     * Read up to and including the ReadyForQuery that ends the command, dropping what comes
+     * before it. The first error on the way is reported once the connection is ready again.
+     */
+    internal function settle(tcp::Deadline $by) : status<Error>
+    {
+        Error? $first = null;
+        while (true) {
+            Message $m = guard $this->channel->next($by) else ($e) {
+                return .error($this->interrupted($e));
+            }
+            if ($m->type == pgsql::protocol::READY) {
+                guard $this->ready($m) else ($e) {
+                    return .error($e);
+                }
+                Error $why = guard $first else {
+                    return .ok;
+                }
+                return .error($why);
+            }
+            if ($m->type == pgsql::protocol::ERROR && $first == null) {
+                $first = .server(pgsql::protocol::serverError($m->body));
+            }
+        }
+    }
+
+    /**
+     * Take a ReadyForQuery's transaction status: the command is over.
+     */
+    internal function ready(const Message& $m) : status<Error>
+    {
+        uint8 $s = guard pgsql::protocol::readyStatus($m->body) else ($e) {
+            return .error($this->broken($e));
+        }
+        $this->status = $s;
+        $this->ending = $this->ending->settled($s);
+        $this->pending = false;
+        return .ok;
+    }
+
+    /**
+     * What an ErrorResponse `$m` says, heard once the command is read to its end and the
+     * connection is ready again.
+     */
+    internal function refused(const Message& $m, tcp::Deadline $by) : Error
+    {
+        ServerError $s = pgsql::protocol::serverError($m->body);
+        guard $this->settle($by) else ($e) {
+            return $e;
+        }
+        return .server($s);
+    }
+
+    /**
+     * Close the connection over `$e`, an answer it cannot read past, and hand `$e` on.
+     */
+    internal function broken(Error $e) : Error
+    {
+        $this->channel->close();
+        return $e;
+    }
+
+    /**
+     * A read failed in the middle of a command. A timeout asks the server to cancel and reads on
+     * for `cancelWait`, so the connection comes back ready; anything else, or a cancel that does
+     * not land in time, closes it. What the caller hears is `$e`.
+     */
+    internal function interrupted(Error $e) : Error
+    {
+        match ($e) {
+            Error::timeout => {
+                if (!$this->channel->alive()) {
+                    return $e;
+                }
+                tcp::Deadline $grace = tcp::Deadline(after: $this->options->cancelWait);
+                status<Error> $asked = pgsql::cancel($this->options, $this->key, by: $grace);
+                if ($asked->failed()) {
+                    $this->channel->close();
+                    return $e;
+                }
+                while (true) {
+                    result<Message, Error> $next = $this->channel->next($grace);
+                    if ($next->failed()) {
+                        $this->channel->close();
+                        return $e;
+                    }
+                    Message $m = $next->unwrap();
+                    if ($m->type == pgsql::protocol::READY) {
+                        status<Error> $took = $this->ready($m);
+                        return $e;
+                    }
+                }
+            },
+            Error::server($s) => {
+                return $e;
+            },
+            else => {
+                $this->channel->close();
+                return $e;
+            },
+        }
+    }
+
+    /**
+     * A command whose reader stopped partway. A server error and a timeout already brought the
+     * connection back to ready; anything else (a row that did not decode) left the rest of the
+     * answer on the wire, so the connection closes.
+     */
+    internal function abandon(const Error& $e) : void
+    {
+        match ($e) {
+            Error::server($s) => {
+                return;
+            },
+            Error::timeout => {
+                return;
+            },
+            else => {
+                if ($this->pending) {
+                    $this->channel->close();
+                }
+            },
+        }
+    }
+}
+
+/**
+ * True for the errors a cached statement gets when it went stale: the server no longer holds it,
+ * or a schema change altered what it returns.
+ */
+internal function stale(const Error& $e) : bool
+{
+    ServerError $s = guard $e->server() else {
+        return false;
+    }
+    return $s->code == ErrorCode::invalidSqlStatementName || ($s->code == ErrorCode::featureNotSupported && $s->message->contains('cached plan'));
+}
+
+/**
+ * Encode `$values` for parameters of `$types` (none: let the server read text) into `$out`, and
+ * the format codes a Bind sends with them (`formatCodes`).
+ */
+internal function encodeAll(const array<Value>& $values, const array<uint32>& $types, string& $out, array<int16>& $formats) : status<Error>
+{
+    array<int16> $each = arr::room<int16>($values->count());
+    foreach ($values as $i => const &$v) {
+        uint32 $oid = 0;
+        if ($i < $types->count()) {
+            $oid = $types[$i];
+        }
+        int16 $f = guard pgsql::protocol::encode($v, $oid, $out) else ($e) {
+            return .error($e);
+        }
+        $each->push($f);
+    }
+    $formats = pgsql::protocol::formatCodes(mv $each);
+    return .ok;
+}

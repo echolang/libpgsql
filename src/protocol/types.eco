@@ -1,0 +1,213 @@
+/**
+ * What a column's type means for decoding: one `Shape` per type this library reads, the element
+ * type of each array type, and which shapes travel in binary.
+ */
+
+namespace pgsql::protocol;
+
+// type OIDs, from pg_type
+internal const uint32 OID_BOOL = 16;
+internal const uint32 OID_BYTEA = 17;
+internal const uint32 OID_CHAR = 18;
+internal const uint32 OID_NAME = 19;
+internal const uint32 OID_INT8 = 20;
+internal const uint32 OID_INT2 = 21;
+internal const uint32 OID_INT4 = 23;
+internal const uint32 OID_TEXT = 25;
+internal const uint32 OID_OID = 26;
+internal const uint32 OID_JSON = 114;
+internal const uint32 OID_FLOAT4 = 700;
+internal const uint32 OID_FLOAT8 = 701;
+internal const uint32 OID_UNKNOWN = 705;
+internal const uint32 OID_BPCHAR = 1042;
+internal const uint32 OID_VARCHAR = 1043;
+internal const uint32 OID_DATE = 1082;
+internal const uint32 OID_TIME = 1083;
+internal const uint32 OID_TIMESTAMP = 1114;
+internal const uint32 OID_TIMESTAMPTZ = 1184;
+internal const uint32 OID_INTERVAL = 1186;
+internal const uint32 OID_TIMETZ = 1266;
+internal const uint32 OID_NUMERIC = 1700;
+internal const uint32 OID_UUID = 2950;
+internal const uint32 OID_JSONB = 3802;
+
+/**
+ * How a column's values are read.
+ */
+internal enum Shape : uint8
+{
+    case boolean;
+    case int2;
+    case int4;
+    case int8;
+    case oid;
+    case float4;
+    case float8;
+    case numeric;
+    case text;
+    case bytea;
+    case json;
+    case jsonb;
+    case uuid;
+    case date;
+    case time;
+    case timestamp;
+    case timestamptz;
+    case interval;
+    case array;
+    // any other type: its text, as the server writes it
+    case other;
+}
+
+internal function shape(uint32 $oid) : Shape
+{
+    if ($oid == OID_INT4) {
+        return Shape::int4;
+    }
+    if ($oid == OID_INT8) {
+        return Shape::int8;
+    }
+    if ($oid == OID_TEXT || $oid == OID_VARCHAR || $oid == OID_BPCHAR || $oid == OID_NAME || $oid == OID_CHAR || $oid == OID_UNKNOWN) {
+        return Shape::text;
+    }
+    if ($oid == OID_BOOL) {
+        return Shape::boolean;
+    }
+    if ($oid == OID_INT2) {
+        return Shape::int2;
+    }
+    if ($oid == OID_FLOAT8) {
+        return Shape::float8;
+    }
+    if ($oid == OID_FLOAT4) {
+        return Shape::float4;
+    }
+    if ($oid == OID_NUMERIC) {
+        return Shape::numeric;
+    }
+    if ($oid == OID_TIMESTAMPTZ) {
+        return Shape::timestamptz;
+    }
+    if ($oid == OID_TIMESTAMP) {
+        return Shape::timestamp;
+    }
+    if ($oid == OID_DATE) {
+        return Shape::date;
+    }
+    if ($oid == OID_TIME) {
+        return Shape::time;
+    }
+    if ($oid == OID_INTERVAL) {
+        return Shape::interval;
+    }
+    if ($oid == OID_UUID) {
+        return Shape::uuid;
+    }
+    if ($oid == OID_JSON) {
+        return Shape::json;
+    }
+    if ($oid == OID_JSONB) {
+        return Shape::jsonb;
+    }
+    if ($oid == OID_BYTEA) {
+        return Shape::bytea;
+    }
+    if ($oid == OID_OID) {
+        return Shape::oid;
+    }
+    if (element($oid) != 0) {
+        return Shape::array;
+    }
+    return Shape::other;
+}
+
+/**
+ * The element type of array type `$oid`, or 0 when it is not an array this library reads.
+ */
+internal function element(uint32 $oid) : uint32
+{
+    if ($oid == 1000) {
+        return OID_BOOL;
+    }
+    if ($oid == 1001) {
+        return OID_BYTEA;
+    }
+    if ($oid == 1002) {
+        return OID_CHAR;
+    }
+    if ($oid == 1003) {
+        return OID_NAME;
+    }
+    if ($oid == 1005) {
+        return OID_INT2;
+    }
+    if ($oid == 1007) {
+        return OID_INT4;
+    }
+    if ($oid == 1009) {
+        return OID_TEXT;
+    }
+    if ($oid == 1014) {
+        return OID_BPCHAR;
+    }
+    if ($oid == 1015) {
+        return OID_VARCHAR;
+    }
+    if ($oid == 1016) {
+        return OID_INT8;
+    }
+    if ($oid == 1021) {
+        return OID_FLOAT4;
+    }
+    if ($oid == 1022) {
+        return OID_FLOAT8;
+    }
+    if ($oid == 1028) {
+        return OID_OID;
+    }
+    if ($oid == 1115) {
+        return OID_TIMESTAMP;
+    }
+    if ($oid == 1182) {
+        return OID_DATE;
+    }
+    if ($oid == 1183) {
+        return OID_TIME;
+    }
+    if ($oid == 1185) {
+        return OID_TIMESTAMPTZ;
+    }
+    if ($oid == 1187) {
+        return OID_INTERVAL;
+    }
+    if ($oid == 1231) {
+        return OID_NUMERIC;
+    }
+    if ($oid == 2951) {
+        return OID_UUID;
+    }
+    if ($oid == 199) {
+        return OID_JSON;
+    }
+    if ($oid == 3807) {
+        return OID_JSONB;
+    }
+    return 0;
+}
+
+/**
+ * True when values of `$oid` are asked for in binary: cheaper to read than their text, and
+ * independent of session settings. NUMERIC, TIMETZ and the types this library does not decode
+ * stay text.
+ */
+internal function binary(uint32 $oid) : bool
+{
+    Shape $s = shape($oid);
+    if ($s == Shape::numeric || $s == Shape::other) {
+        return false;
+    }
+    if ($s == Shape::array) {
+        return binary(element($oid));
+    }
+    return true;
+}

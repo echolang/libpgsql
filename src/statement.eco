@@ -1,0 +1,155 @@
+namespace pgsql;
+
+/**
+ * A statement prepared on the server once and run as often as needed. Closed on the server when
+ * dropped, or by `close()`.
+ */
+public class Statement
+{
+    private Connection $db;
+    private Prepared $prepared;
+    private bool $closed;
+
+    /**
+     * The placeholder names, in parameter order, when the SQL used `:name`. Empty for `$n`.
+     */
+    public const array<string> $names;
+
+    internal constructor(Connection $db, Prepared $prepared)
+    {
+        $this->db = $db;
+        $this->prepared = $prepared;
+        $this->closed = false;
+        $this->names = $prepared->names;
+    }
+
+    destructor()
+    {
+        $this->close();
+    }
+
+    /**
+     * How many values each run takes.
+     */
+    public const function params() : usize
+    {
+        return $this->prepared->types->count();
+    }
+
+    /**
+     * The type of each parameter, as the server inferred it.
+     */
+    public const function types() : array<PgType>
+    {
+        array<PgType> $out = arr::room<PgType>($this->prepared->types->count());
+        foreach ($this->prepared->types as $t) {
+            $out->push(PgType::from($t));
+        }
+        return $out;
+    }
+
+    /**
+     * The columns each run returns. Empty for a statement that returns no rows.
+     */
+    public const function columns() : Columns
+    {
+        return $this->prepared->columns;
+    }
+
+    /**
+     * Run with no values and read the whole result.
+     */
+    public function query(by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        return $this->fetch(Params(), $by);
+    }
+
+    /**
+     * Run with `$params` and read the whole result.
+     */
+    public function query(Params $params, by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        return $this->fetch($params, $by);
+    }
+
+    /**
+     * Run with no values and return what it did.
+     */
+    public function exec(by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        return $this->apply(Params(), $by);
+    }
+
+    /**
+     * Run with `$params` and return what it did.
+     */
+    public function exec(Params $params, by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        return $this->apply($params, $by);
+    }
+
+    /**
+     * Run with no values and read rows one at a time.
+     */
+    public function stream(by: tcp::Deadline? $by = null) : result<Rows, Error>
+    {
+        return $this->open(Params(), $by);
+    }
+
+    /**
+     * Run with `$params` and read rows one at a time.
+     */
+    public function stream(Params $params, by: tcp::Deadline? $by = null) : result<Rows, Error>
+    {
+        return $this->open($params, $by);
+    }
+
+    /**
+     * Free the statement on the server, with the connection's next command. Safe to call twice.
+     */
+    public function close() : void
+    {
+        if ($this->closed) {
+            return;
+        }
+        $this->closed = true;
+        if ($this->db->alive()) {
+            $this->db->closing->push($this->prepared->name);
+        }
+    }
+
+    private function head(const Params& $params, tcp::Deadline $by) : result<Head, Error>
+    {
+        if ($this->closed) {
+            return .error(.invalid('the statement is closed'));
+        }
+        return $this->db->run($this->prepared, $params, $by);
+    }
+
+    private function fetch(Params $params, tcp::Deadline? $by) : result<ResultSet, Error>
+    {
+        tcp::Deadline $until = $this->db->deadline($by);
+        Head $h = guard $this->head($params, $until) else ($e) {
+            return .error($e);
+        }
+        return $this->db->whole($h, $until);
+    }
+
+    private function apply(Params $params, tcp::Deadline? $by) : result<Outcome, Error>
+    {
+        tcp::Deadline $until = $this->db->deadline($by);
+        Head $h = guard $this->head($params, $until) else ($e) {
+            return .error($e);
+        }
+        return $this->db->outcome($h, $until);
+    }
+
+    private function open(Params $params, tcp::Deadline? $by) : result<Rows, Error>
+    {
+        tcp::Deadline $until = $this->db->deadline($by);
+        Head $h = guard $this->head($params, $until) else ($e) {
+            return .error($e);
+        }
+        return $this->db->rows($h, $until);
+    }
+}

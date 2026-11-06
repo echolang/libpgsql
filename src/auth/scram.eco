@@ -1,0 +1,170 @@
+/**
+ * SCRAM-SHA-256 (RFC 5802, RFC 7677) as PostgreSQL speaks it: no channel binding (there is no
+ * TLS to bind to), and an empty user name, since the server takes the user from the startup
+ * message. The password is used as its bytes: SASLprep would only change a non-ASCII password,
+ * and libpq falls back to the raw bytes as well when it cannot prepare one.
+ */
+
+namespace pgsql::auth;
+
+internal const string MECHANISM = 'SCRAM-SHA-256';
+
+// the gs2 header for "no channel binding", and its base64 for the final message
+internal const string GS2 = 'n,,';
+internal const string GS2_BASE64 = 'biws';
+
+// PostgreSQL uses 4096; more than this is a server trying to keep the client busy
+internal const uint32 MAX_ITERATIONS = 16777216;
+
+/**
+ * One SCRAM exchange, from the client's side.
+ */
+internal class Scram
+{
+    private string $password;
+    private string $nonce;
+    private string $firstBare;
+    private string $authMessage;
+    private string $salted;
+
+    /**
+     * `$nonce` is the client's: printable, no comma. `$user` is empty for PostgreSQL.
+     */
+    internal constructor(const string& $user, const string& $password, const string& $nonce)
+    {
+        $this->password = $password;
+        $this->nonce = $nonce;
+        $this->firstBare = "n={$user},r={$nonce}";
+        $this->authMessage = '';
+        $this->salted = '';
+    }
+
+    /**
+     * A fresh exchange with 18 random bytes of nonce, as libpq uses.
+     */
+    internal static function start(const string& $password) : result<Scram, pgsql::Error>
+    {
+        string $raw = guard crypto::random(18) else {
+            return .error(.auth(.scram('the system has no randomness for the nonce')));
+        }
+        return .ok(Scram('', $password, crypto::base64($raw)));
+    }
+
+    /**
+     * The client-first-message.
+     */
+    internal const function first() : string
+    {
+        string $out = GS2;
+        $out->append($this->firstBare);
+        return $out;
+    }
+
+    /**
+     * The client-final-message, answering the server-first-message `$server`.
+     */
+    internal function final(const string& $server) : result<string, pgsql::Error>
+    {
+        string $combined = '';
+        string $salt64 = '';
+        string $count = '';
+        foreach (str::split($server, ',')->owned() as $part) {
+            if ($part->starts('r=')) {
+                $combined = $part->sub(2, $part->size() - 2);
+            } else if ($part->starts('s=')) {
+                $salt64 = $part->sub(2, $part->size() - 2);
+            } else if ($part->starts('i=')) {
+                $count = $part->sub(2, $part->size() - 2);
+            } else if ($part->starts('m=')) {
+                return .error(.auth(.scram('the server asks for an extension this client does not know')));
+            }
+        }
+        if ($combined->size() <= $this->nonce->size() || !$combined->starts($this->nonce)) {
+            return .error(.auth(.scram('the server nonce does not extend the client nonce')));
+        }
+        string $salt = guard crypto::unbase64($salt64) else {
+            return .error(.auth(.scram('the salt is not base64')));
+        }
+        if ($salt->empty()) {
+            return .error(.auth(.scram('an empty salt')));
+        }
+        uint64 $n = guard str::uint($count) else {
+            return .error(.auth(.scram("iteration count '{$count}' is not a number")));
+        }
+        if ($n == 0 || $n > MAX_ITERATIONS as uint64) {
+            return .error(.auth(.scram("an iteration count of {$n}")));
+        }
+
+        $this->salted = hi($this->password, $salt, $n as uint32);
+        string $withoutProof = 'c=';
+        $withoutProof->append(GS2_BASE64);
+        $withoutProof->append(',r=');
+        $withoutProof->append($combined);
+        $this->authMessage = "{$this->firstBare},{$server},{$withoutProof}";
+        string $clientKey = crypto::hmacSha256($this->salted, 'Client Key');
+        string $stored = crypto::sha256($clientKey);
+        string $signature = crypto::hmacSha256($stored, $this->authMessage);
+        string $proof = xor($clientKey, $signature);
+        string $out = $withoutProof;
+        $out->append(',p=');
+        $out->append(crypto::base64($proof));
+        return .ok($out);
+    }
+
+    /**
+     * Check the server-final-message: its signature proves the server knows the password too.
+     */
+    internal const function verify(const string& $server) : status<pgsql::Error>
+    {
+        if ($server->starts('e=')) {
+            return .error(.auth(.scram("the server refused: {$server->sub(2, $server->size() - 2)}")));
+        }
+        usize $comma = $server->find(',');
+        string $v = $server->sub(0, $comma);
+        if (!$v->starts('v=') || $this->salted->empty()) {
+            return .error(.auth(.scram('no server signature')));
+        }
+        string $got = guard crypto::unbase64($v->sub(2, $v->size() - 2)) else {
+            return .error(.auth(.scram('the server signature is not base64')));
+        }
+        string $serverKey = crypto::hmacSha256($this->salted, 'Server Key');
+        string $want = crypto::hmacSha256($serverKey, $this->authMessage);
+        if (!crypto::equal($got, $want)) {
+            return .error(.auth(.scram('the server signature is wrong: it does not know the password')));
+        }
+        return .ok;
+    }
+}
+
+/**
+ * Hi() of RFC 5802: PBKDF2 with HMAC-SHA-256, one block of output.
+ */
+internal function hi(const string& $password, const string& $salt, uint32 $iterations) : string
+{
+    string $first = $salt;
+    tcp::wire::putBe32($first, 1);
+    string $u = crypto::hmacSha256($password, $first);
+    string $out = $u;
+    uint32 $i = 1;
+    while ($i < $iterations) {
+        $u = crypto::hmacSha256($password, $u);
+        $out = xor($out, $u);
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+/**
+ * `$a` XOR `$b`, byte by byte. Same length.
+ */
+internal function xor(const string& $a, const string& $b) : string
+{
+    string $out = '';
+    $out->reserve($a->size());
+    usize $i = 0;
+    while ($i < $a->size()) {
+        $out->push($a->byte($i) ^ $b->byte($i));
+        $i = $i + 1;
+    }
+    return $out;
+}

@@ -1,0 +1,512 @@
+/**
+ * A scripted PostgreSQL server for the session tests: listens, accepts one client on a thread of
+ * its own, and plays whatever the test's script says, message by message. No real server needed.
+ */
+
+use std::thread;
+use pgsql::protocol::{putCString};
+
+/**
+ * One message from the client: its type byte and body.
+ */
+internal struct Msg
+{
+    internal uint8 $type;
+    internal string $body;
+}
+
+/**
+ * The server's side of one connection.
+ */
+internal class Wire
+{
+    internal tcp::Stream $s;
+    internal tcp::Reader $r;
+    // where the client's cancel requests arrive
+    internal tcp::Listener $l;
+
+    internal constructor(tcp::Stream $s, tcp::Listener $l)
+    {
+        $this->s = $s;
+        $this->r = tcp::Reader(max: 1073741824);
+        $this->l = $l;
+    }
+
+    /**
+     * The client's messages up to and including its next Sync.
+     */
+    internal function batch() : array<Msg>
+    {
+        array<Msg> $out = array<Msg>();
+        while (true) {
+            Msg $m = $this->recv();
+            $out->push($m);
+            if ($m->type == pgsql::protocol::SYNC) {
+                return $out;
+            }
+        }
+    }
+
+    /**
+     * The message types of `batch()`, as letters: `PDS`, `BES`.
+     */
+    internal function kinds() : string
+    {
+        string $k = '';
+        foreach ($this->batch() as const &$m) {
+            $k->push($m->type);
+        }
+        return $k;
+    }
+
+    /**
+     * Accept the cancel request a client sends on a connection of its own: its process id and
+     * secret.
+     */
+    internal function cancelled() : string
+    {
+        tcp::Stream? $maybe = guard $this->l->accept(tcp::Deadline(ms: 5000)) else ($e) {
+            die("accept cancel: {$e}");
+        }
+        tcp::Stream $c = guard $maybe else {
+            die('no cancel request came');
+        }
+        tcp::Reader $r = tcp::Reader();
+        string? $got = guard $r->exactly($c, 16, tcp::Deadline(ms: 5000)) else ($e) {
+            die("read cancel: {$e}");
+        }
+        string $req = guard $got else {
+            die('a short cancel request');
+        }
+        $c->close();
+        assert(tcp::wire::be32($req, 4) == pgsql::protocol::CANCEL_REQUEST);
+        return $req->sub(8, 8);
+    }
+
+    /**
+     * The answers to a Parse and a Describe of a statement: its parameter types and columns.
+     */
+    internal function describe(const array<uint32>& $params, const string& $columns) : void
+    {
+        $this->send(pgsql::protocol::PARSE_COMPLETE, '');
+        $this->send(pgsql::protocol::PARAMETER_DESCRIPTION, paramTypes($params));
+        if ($columns->empty()) {
+            $this->send(pgsql::protocol::NO_DATA, '');
+        } else {
+            $this->send(pgsql::protocol::ROW_DESCRIPTION, $columns);
+        }
+    }
+
+    /**
+     * Rows as text, then the command's end.
+     */
+    internal function rows(const string& $columns, const array<array<string>>& $rows) : void
+    {
+        $this->send(pgsql::protocol::ROW_DESCRIPTION, $columns);
+        foreach ($rows as const &$r) {
+            $this->send(pgsql::protocol::DATA_ROW, dataRow($r));
+        }
+        $this->send(pgsql::protocol::COMMAND_COMPLETE, commandComplete("SELECT {$rows->count()}"));
+    }
+
+    /**
+     * Send one message.
+     */
+    internal function send(uint8 $type, const string& $body) : void
+    {
+        if (!$this->trySend($type, $body)) {
+            die('fake send: the client went away');
+        }
+    }
+
+    /**
+     * Send one message the client may hang up on: false once it has.
+     */
+    internal function trySend(uint8 $type, const string& $body) : bool
+    {
+        string $head = '';
+        pgsql::protocol::head($head, $type, $body->size());
+        guard $this->s->write($head, $body, tcp::Deadline(ms: 5000)) else {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Raw bytes, as they are.
+     */
+    internal function sendRaw(const string& $bytes) : void
+    {
+        guard $this->s->write($bytes, tcp::Deadline(ms: 5000)) else ($e) {
+            die("fake send: {$e}");
+        }
+    }
+
+    /**
+     * The startup message: its protocol number and name/value pairs.
+     */
+    internal function startup() : Startup
+    {
+        string $len = $this->bytes(4, 5000);
+        usize $n = tcp::wire::be32($len, 0) as usize;
+        string $rest = $this->bytes($n - 4, 5000);
+        uint32 $protocol = tcp::wire::be32($rest, 0);
+        ordered_map<string, string> $params = ordered_map<string, string>();
+        pgsql::protocol::Cursor $c = pgsql::protocol::Cursor($rest, 4);
+        while (true) {
+            string $k = $c->cstring()->or('');
+            if ($k->empty()) {
+                break;
+            }
+            $params[$k] = $c->cstring()->or('');
+        }
+        return Startup($protocol, $params);
+    }
+
+    /**
+     * The next message from the client. Dies after 5 seconds without one.
+     */
+    internal function recv() : Msg
+    {
+        Msg $m = guard $this->tryRecv(5000) else {
+            die('fake recv: the client went away');
+        }
+        return $m;
+    }
+
+    /**
+     * The next message, or null once the client has gone or `$ms` have passed.
+     */
+    internal function tryRecv(int64 $ms) : Msg?
+    {
+        string? $h = guard $this->r->exactly($this->s, 5, tcp::Deadline(ms: $ms)) else {
+            return null;
+        }
+        string $head = guard $h else {
+            return null;
+        }
+        usize $len = tcp::wire::be32($head, 1) as usize;
+        string $body = '';
+        if ($len > 4) {
+            string? $b = guard $this->r->exactly($this->s, $len - 4, tcp::Deadline(ms: $ms)) else {
+                return null;
+            }
+            string $got = guard $b else {
+                return null;
+            }
+            $body = $got;
+        }
+        Msg? $m = Msg($head->byte(0), $body);
+        return $m;
+    }
+
+    /**
+     * The next message, which has to be of `$type`. Its body comes back.
+     */
+    internal function expect(uint8 $type) : string
+    {
+        Msg $m = $this->recv();
+        if ($m->type != $type) {
+            die("fake: expected message {$type}, got {$m->type}");
+        }
+        return $m->body;
+    }
+
+    internal function bytes(usize $n, int64 $ms) : string
+    {
+        string? $got = guard $this->r->exactly($this->s, $n, tcp::Deadline(ms: $ms)) else ($e) {
+            die("fake read: {$e}");
+        }
+        string $b = guard $got else {
+            die('fake read: timed out');
+        }
+        return $b;
+    }
+
+    /**
+     * Take the startup message and let the client in without a password.
+     */
+    internal function welcome() : Startup
+    {
+        Startup $st = $this->startup();
+        $this->letIn();
+        return $st;
+    }
+
+    /**
+     * What a server sends once the password checks out.
+     */
+    internal function letIn() : void
+    {
+        $this->send(pgsql::protocol::AUTH, auth(0, ''));
+        $this->send(pgsql::protocol::PARAMETER_STATUS, setting('server_version', '18.0'));
+        $this->send(pgsql::protocol::PARAMETER_STATUS, setting('TimeZone', 'UTC'));
+        $this->send(pgsql::protocol::BACKEND_KEY, backendKey(4242, 'k3y!'));
+        $this->ready();
+    }
+
+    internal function ready(uint8 $status = 73) : void
+    {
+        string $b = '';
+        $b->push($status);
+        $this->send(pgsql::protocol::READY, $b);
+    }
+
+    /**
+     * An ErrorResponse with SQLSTATE `$state`.
+     */
+    internal function error(const string& $state, const string& $message) : void
+    {
+        $this->send(pgsql::protocol::ERROR, errorFields('ERROR', $state, $message));
+    }
+
+    /**
+     * Wait for the client to hang up: its Terminate, or the end of the stream.
+     */
+    internal function bye() : void
+    {
+        while (true) {
+            Msg $m = guard $this->tryRecv(2000) else {
+                return;
+            }
+            if ($m->type == pgsql::protocol::TERMINATE) {
+                return;
+            }
+        }
+    }
+}
+
+/**
+ * A RowDescription of text columns, `name:oid` each (`id:23`).
+ */
+internal function columns(const array<string>& $specs, int16 $format = 0) : string
+{
+    string $b = '';
+    tcp::wire::putBe16($b, $specs->count() as uint16);
+    foreach ($specs as const &$spec) {
+        usize $colon = $spec->find(':');
+        putCString($b, $spec->sub(0, $colon));
+        tcp::wire::putBe32($b, 0);
+        tcp::wire::putBe16($b, 0);
+        tcp::wire::putBe32($b, (str::uint($spec->sub($colon + 1, $spec->size() - $colon - 1)) ?? 25) as uint32);
+        tcp::wire::putBe16($b, 65535);
+        tcp::wire::putBe32($b, 4294967295);
+        tcp::wire::putBe16($b, $format as uint16);
+    }
+    return $b;
+}
+
+/**
+ * A DataRow; `<NULL>` is NULL.
+ */
+internal function dataRow(const array<string>& $values) : string
+{
+    string $b = '';
+    tcp::wire::putBe16($b, $values->count() as uint16);
+    foreach ($values as const &$v) {
+        if ($v == '<NULL>') {
+            tcp::wire::putBe32($b, 4294967295);
+            continue;
+        }
+        tcp::wire::putBe32($b, $v->size() as uint32);
+        $b->append($v);
+    }
+    return $b;
+}
+
+internal function paramTypes(const array<uint32>& $oids) : string
+{
+    string $b = '';
+    tcp::wire::putBe16($b, $oids->count() as uint16);
+    foreach ($oids as $o) {
+        tcp::wire::putBe32($b, $o);
+    }
+    return $b;
+}
+
+internal function be32(uint32 $v) : string
+{
+    string $b = '';
+    tcp::wire::putBe32($b, $v);
+    return $b;
+}
+
+internal function be64(uint64 $v) : string
+{
+    string $b = '';
+    tcp::wire::putBe64($b, $v);
+    return $b;
+}
+
+internal struct Startup
+{
+    internal uint32 $protocol;
+    internal ordered_map<string, string> $params;
+}
+
+internal function auth(uint32 $code, const string& $data) : string
+{
+    string $b = '';
+    tcp::wire::putBe32($b, $code);
+    $b->append($data);
+    return $b;
+}
+
+internal function setting(const string& $name, const string& $value) : string
+{
+    string $b = '';
+    putCString($b, $name);
+    putCString($b, $value);
+    return $b;
+}
+
+internal function backendKey(uint32 $pid, const string& $secret) : string
+{
+    string $b = '';
+    tcp::wire::putBe32($b, $pid);
+    $b->append($secret);
+    return $b;
+}
+
+internal function errorFields(const string& $severity, const string& $state, const string& $message) : string
+{
+    string $b = '';
+    $b->push(83);
+    putCString($b, $severity);
+    $b->push(86);
+    putCString($b, $severity);
+    $b->push(67);
+    putCString($b, $state);
+    $b->push(77);
+    putCString($b, $message);
+    $b->push(0);
+    return $b;
+}
+
+internal function commandComplete(const string& $tag) : string
+{
+    string $b = '';
+    putCString($b, $tag);
+    return $b;
+}
+
+/**
+ * The server's side of SCRAM-SHA-256 for `$password`, with a fixed salt.
+ */
+internal class ScramServer
+{
+    internal string $password;
+    internal string $salt = 'saltsaltsalt';
+    internal uint32 $iterations = 4096;
+    internal string $first = '';
+    internal string $serverFirst = '';
+
+    internal constructor(string $password)
+    {
+        $this->password = $password;
+    }
+
+    /**
+     * Run the exchange on `$w`, the client's SASLInitialResponse still unread. True when the
+     * client's proof checked out (the final message is sent either way, `$lie` spoils it).
+     */
+    internal function run(Wire $w, bool $lie = false) : bool
+    {
+        string $offer = '';
+        putCString($offer, 'SCRAM-SHA-256-PLUS');
+        putCString($offer, 'SCRAM-SHA-256');
+        $offer->push(0);
+        $w->send(pgsql::protocol::AUTH, auth(10, $offer));
+        string $initial = $w->expect(pgsql::protocol::PASSWORD);
+        pgsql::protocol::Cursor $c = pgsql::protocol::Cursor($initial);
+        assert($c->cstring()->or('') == 'SCRAM-SHA-256');
+        $c->skip(4);
+        string $clientFirst = $c->rest();
+        assert($clientFirst->starts('n,,n=,r='));
+        string $bare = $clientFirst->sub(3, $clientFirst->size() - 3);
+        string $nonce = $bare->sub(5, $bare->size() - 5);
+        string $salt64 = crypto::base64($this->salt);
+        $this->serverFirst = "r={$nonce}SERVERNONCE,s={$salt64},i={$this->iterations}";
+        $w->send(pgsql::protocol::AUTH, auth(11, $this->serverFirst));
+        string $final = $w->expect(pgsql::protocol::PASSWORD);
+        usize $p = $final->find(',p=');
+        string $withoutProof = $final->sub(0, $p);
+        string $proof = crypto::unbase64($final->sub($p + 3, $final->size() - $p - 3)) ?? '';
+        string $salted = pgsql::auth::hi($this->password, $this->salt, $this->iterations);
+        string $authMessage = "{$bare},{$this->serverFirst},{$withoutProof}";
+        string $stored = crypto::sha256(crypto::hmacSha256($salted, 'Client Key'));
+        string $clientKey = pgsql::auth::xor($proof, crypto::hmacSha256($stored, $authMessage));
+        bool $ok = $proof->size() == 32 && crypto::sha256($clientKey) == $stored;
+        string $sig = crypto::hmacSha256(crypto::hmacSha256($salted, 'Server Key'), $authMessage);
+        if ($lie) {
+            $sig = crypto::sha256('not the signature');
+        }
+        if ($ok) {
+            string $sig64 = crypto::base64($sig);
+            $w->send(pgsql::protocol::AUTH, auth(12, "v={$sig64}"));
+        }
+        return $ok;
+    }
+}
+
+internal struct Fake
+{
+    internal tcp::Address $at;
+    internal thread::handle $server;
+}
+
+internal function fake(function<void(Wire)> $script) : Fake
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+        die("listen: {$e}");
+    }
+    return serveOn($l, $script);
+}
+
+internal function fakeUnix(const string& $path, function<void(Wire)> $script) : Fake
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(unix: $path)) else ($e) {
+        die("listen: {$e}");
+    }
+    return serveOn($l, $script);
+}
+
+internal function serveOn(tcp::Listener $l, function<void(Wire)> $script) : Fake
+{
+    thread::handle $h = guard thread::spawn(function() : void {
+        tcp::Stream? $maybe = guard $l->accept(tcp::Deadline(ms: 5000)) else ($e) {
+            die("accept: {$e}");
+        }
+        tcp::Stream $s = guard $maybe else {
+            die('no client came');
+        }
+        $script(Wire($s, $l));
+        $s->finish(tcp::Deadline(ms: 1000));
+        $l->close();
+    }) else ($e) {
+        die($e->message());
+    }
+    return Fake($l->local, $h);
+}
+
+internal function optionsFor(const Fake& $f) : pgsql::Options
+{
+    pgsql::Options $o = pgsql::Options($user: 'app', $password: 'secret', $database: 'shop');
+    $o->host = '127.0.0.1';
+    $o->port = $f->at->port;
+    $o->connectTimeout = std::time::duration::secs(5);
+    return $o;
+}
+
+internal function login(const pgsql::Options& $o) : pgsql::Connection
+{
+    pgsql::Connection $db = guard pgsql::Connection::open($o) else ($e) {
+        die("connect: {$e}");
+    }
+    return $db;
+}
+
+internal function login(const Fake& $f) : pgsql::Connection
+{
+    return login(optionsFor($f));
+}

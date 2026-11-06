@@ -1,0 +1,159 @@
+namespace pgsql;
+
+#[docs::see: ["pgsql::Value"]]
+
+/**
+ * The values a statement is run with. An array literal for `$1`, `$2`, ..., a map for `:name`. A
+ * class, so `add`/`set` chains stay on the same builder; `[]` starts empty for a loop.
+ *
+ * ```echo
+ * $db->exec($sql, ['name' => 'Lamp', 'stock' => 12]);
+ * ```
+ */
+public class Params
+{
+    private array<Value> $positional;
+    private ordered_map<string, Value> $named;
+
+    public constructor()
+    {
+        $this->positional = array<Value>();
+        $this->named = ordered_map<string, Value>();
+    }
+
+    /**
+     * Positional values, one per `$n`, in order. Start of a chain; a literal to `exec` does the
+     * same.
+     */
+    public static function of(array<Value> $values) : Params
+    {
+        return Params()->add($values);
+    }
+
+    /**
+     * Named values, one per `:name`. Start of a chain; a literal to `exec` does the same.
+     */
+    public static function named(ordered_map<string, Value> $values) : Params
+    {
+        return Params()->set($values);
+    }
+
+    /**
+     * Values for the next `$n` placeholders, in order.
+     */
+    public function add(array<Value> $values) : Params
+    {
+        foreach ($values as const &$v) {
+            $this->positional->push($v);
+        }
+        return $this;
+    }
+
+    /**
+     * The value for `:name`. Setting a name again replaces it.
+     */
+    public function set(const string& $name, Value $v) : Params
+    {
+        $this->named[$name] = $v;
+        return $this;
+    }
+
+    /**
+     * Several named values at once.
+     */
+    public function set(ordered_map<string, Value> $values) : Params
+    {
+        foreach ($values as $name => $v) {
+            $this->named[$name] = $v;
+        }
+        return $this;
+    }
+
+    /**
+     * One value for the next `$n`. What `$params[] = $v` runs.
+     */
+    internal function push(Value $v) : void
+    {
+        $this->positional->push($v);
+    }
+
+    /**
+     * How many values: positional or named, whichever this holds.
+     */
+    public const function count() : usize
+    {
+        return $this->positional->count() + $this->named->count();
+    }
+
+    public function clear() : void
+    {
+        $this->positional->clear();
+        $this->named->clear();
+    }
+
+    /**
+     * The values in parameter order. `$names` is empty for `$n` placeholders; then `$count`
+     * values are wanted.
+     */
+    internal const function resolve(const array<string>& $names, usize $count) : result<array<Value>, Error>
+    {
+        if (!$this->positional->empty() && !$this->named->empty()) {
+            return .error(.invalid('the params mix add() and set(): use one or the other'));
+        }
+        if ($names->empty()) {
+            if (!$this->named->empty()) {
+                if ($count == 0) {
+                    return .error(.invalid('named values for SQL without placeholders'));
+                }
+                return .error(.invalid('named values for SQL with $n placeholders: write :name in the SQL'));
+            }
+            if ($this->positional->count() != $count) {
+                return .error(.invalid("the SQL takes {$count} values and {$this->positional->count()} were given"));
+            }
+            return .ok($this->positional->clone());
+        }
+
+        if (!$this->positional->empty()) {
+            return .error(.invalid('positional values for SQL with :name placeholders: use set()'));
+        }
+        array<Value> $out = arr::room<Value>($names->count());
+        foreach ($names as const &$name) {
+            if (!$this->named->has($name)) {
+                return .error(.invalid("no value for :{$name}"));
+            }
+            $out->push($this->named->get($name));
+        }
+        // a value nothing in the SQL names is a typo
+        if ($this->named->count() != $names->count()) {
+            foreach ($this->named->keys() as $key) {
+                bool $used = false;
+                foreach ($names as const &$name) {
+                    if ($name == $key) {
+                        $used = true;
+                        break;
+                    }
+                }
+                if (!$used) {
+                    return .error(.invalid("':{$key}' is not in the statement"));
+                }
+            }
+        }
+        return .ok($out);
+    }
+}
+
+/**
+ * `$params[] = $v` adds the next `$n` value. Also how an array literal fills Params.
+ */
+operator (Params& $p)[] = (Value $v) : void
+{
+    $p->push($v);
+}
+
+/**
+ * `$params['name'] = $v` sets `:name`. Also how a map literal fills Params.
+ */
+operator (Params& $p)[const string& $name] = (Value $v) : void
+{
+    $p->set($name, $v);
+}

@@ -1,0 +1,27 @@
+{
+  "lockVersion": 2,
+  "packages": [
+    {
+      "name": "echolang/libcrypto",
+      "version": "0.3.3",
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/echolang/libcrypto"
+      },
+      "rev": "3fba8f815d9e64bdad62e2b7182322061690ce39",
+      "sha256": "967109386299591b31f1a257597e6931800e241435b3b81b959404149e49e343",
+      "requires": []
+    },
+    {
+      "name": "echolang/libtcp",
+      "version": "0.2.0",
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/echolang/libtcp"
+      },
+      "rev": "3f1fbf2875e3c37996d511278fca050c2d6b1c1c",
+      "sha256": "8089019088fe04060bc7527a86297a8d9d98df6ffe073c34008b37b35be80857",
+      "requires": []
+    }
+  ]
+}

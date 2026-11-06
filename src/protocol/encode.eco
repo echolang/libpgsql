@@ -1,0 +1,520 @@
+/**
+ * Parameters on the way out: each value written as the server will read it, an int32 length and
+ * its bytes, in binary when the parameter's type has a binary form this value fits, as text
+ * otherwise. Text is what the server parses with the parameter type's own input function, so a
+ * `.text('42')` for an INTEGER works, and so does any type this library has no binary form for.
+ */
+
+namespace pgsql::protocol;
+
+use pgsql::{Value, Date, Time, DateTime, Interval, Uuid};
+
+/**
+ * Write `$v` for a parameter of type `$oid` (0 when the server was not asked) and answer its
+ * format code.
+ */
+internal function encode(const Value& $v, uint32 $oid, string& $out) : result<int16, pgsql::Error>
+{
+    if ($v->isNull()) {
+        tcp::wire::putBe32($out, NULL_AT);
+        return .ok(TEXT);
+    }
+    if ($oid != 0) {
+        bool $done = guard binaryOf($v, shape($oid), $oid, $out) else ($e) {
+            return .error($e);
+        }
+        if ($done) {
+            return .ok(BINARY);
+        }
+    }
+    string $t = wireText($v);
+    tcp::wire::putBe32($out, $t->size() as uint32);
+    $out->append($t);
+    return .ok(TEXT);
+}
+
+/**
+ * A value as text for the server to parse: `textOf`, except that a TIMESTAMP says it is UTC. Read
+ * as a TIMESTAMPTZ it is then the instant the binary form sends, whatever the session's zone; a
+ * TIMESTAMP input ignores the zone.
+ */
+internal function wireText(const Value& $v) : string
+{
+    match ($v) {
+        Value::timestamp($t) => {
+            return textOf(Value::timestamptz($t));
+        },
+        Value::list($items) => {
+            return arrayText($items, true);
+        },
+        else => {
+            return textOf($v);
+        },
+    }
+}
+
+/**
+ * Write `$v` in binary for shape `$s`, length first. False, with nothing written, when this value
+ * has no binary form for that shape.
+ */
+internal function binaryOf(const Value& $v, Shape $s, uint32 $oid, string& $out) : result<bool, pgsql::Error>
+{
+    match ($v) {
+        Value::int($n) => {
+            int64 $i = $n;
+            if ($s == Shape::int8) {
+                tcp::wire::putBe32($out, 8);
+                tcp::wire::putBe64($out, $i as uint64);
+                return .ok(true);
+            }
+            if ($s == Shape::int4) {
+                if ($i < -2147483648 || $i > 2147483647) {
+                    return .error(.invalid("{$i} does not fit an integer parameter"));
+                }
+                tcp::wire::putBe32($out, 4);
+                tcp::wire::putBe32($out, mem::bit_cast<uint32, int32>($i as int32));
+                return .ok(true);
+            }
+            if ($s == Shape::int2) {
+                if ($i < -32768 || $i > 32767) {
+                    return .error(.invalid("{$i} does not fit a smallint parameter"));
+                }
+                tcp::wire::putBe32($out, 2);
+                tcp::wire::putBe16($out, mem::bit_cast<uint16, int16>($i as int16));
+                return .ok(true);
+            }
+            if ($s == Shape::oid) {
+                if ($i < 0 || $i > 4294967295) {
+                    return .error(.invalid("{$i} does not fit an oid parameter"));
+                }
+                tcp::wire::putBe32($out, 4);
+                tcp::wire::putBe32($out, $i as uint32);
+                return .ok(true);
+            }
+            if ($s == Shape::float8) {
+                tcp::wire::putBe32($out, 8);
+                tcp::wire::putBe64($out, mem::bit_cast<uint64, float64>($i as float64));
+                return .ok(true);
+            }
+            return .ok(false);
+        },
+        Value::float($f) => {
+            float64 $x = $f;
+            if ($s == Shape::float8) {
+                tcp::wire::putBe32($out, 8);
+                tcp::wire::putBe64($out, mem::bit_cast<uint64, float64>($x));
+                return .ok(true);
+            }
+            if ($s == Shape::float4) {
+                tcp::wire::putBe32($out, 4);
+                tcp::wire::putBe32($out, mem::bit_cast<uint32, float32>($x as float32));
+                return .ok(true);
+            }
+            return .ok(false);
+        },
+        Value::bool($b) => {
+            if ($s != Shape::boolean) {
+                return .ok(false);
+            }
+            tcp::wire::putBe32($out, 1);
+            if ($b) {
+                $out->push(1);
+            } else {
+                $out->push(0);
+            }
+            return .ok(true);
+        },
+        Value::text($t) => {
+            // a text's binary form is its bytes
+            if ($s == Shape::text || $s == Shape::bytea || $s == Shape::json) {
+                tcp::wire::putBe32($out, $t->size() as uint32);
+                $out->append($t);
+                return .ok(true);
+            }
+            if ($s == Shape::jsonb) {
+                jsonb($t, $out);
+                return .ok(true);
+            }
+            return .ok(false);
+        },
+        Value::json($j) => {
+            if ($s == Shape::json || $s == Shape::text) {
+                tcp::wire::putBe32($out, $j->size() as uint32);
+                $out->append($j);
+                return .ok(true);
+            }
+            if ($s == Shape::jsonb) {
+                jsonb($j, $out);
+                return .ok(true);
+            }
+            return .ok(false);
+        },
+        Value::bytes($b) => {
+            if ($s != Shape::bytea) {
+                return .ok(false);
+            }
+            tcp::wire::putBe32($out, $b->size() as uint32);
+            $out->append($b);
+            return .ok(true);
+        },
+        Value::uuid($u) => {
+            if ($s != Shape::uuid) {
+                return .ok(false);
+            }
+            tcp::wire::putBe32($out, 16);
+            $out->append($u->bytes);
+            return .ok(true);
+        },
+        Value::date($d) => {
+            if ($s == Shape::date) {
+                tcp::wire::putBe32($out, 4);
+                tcp::wire::putBe32($out, daysOf($d) as uint32);
+                return .ok(true);
+            }
+            if ($s == Shape::timestamp || $s == Shape::timestamptz) {
+                tcp::wire::putBe32($out, 8);
+                tcp::wire::putBe64($out, microsOf(DateTime(midnight: $d)) as uint64);
+                return .ok(true);
+            }
+            return .ok(false);
+        },
+        Value::time($t) => {
+            if ($s != Shape::time) {
+                return .ok(false);
+            }
+            tcp::wire::putBe32($out, 8);
+            tcp::wire::putBe64($out, $t->micros() as uint64);
+            return .ok(true);
+        },
+        Value::timestamp($t) => {
+            if ($s != Shape::timestamp && $s != Shape::timestamptz) {
+                return .ok(false);
+            }
+            tcp::wire::putBe32($out, 8);
+            tcp::wire::putBe64($out, microsOf($t) as uint64);
+            return .ok(true);
+        },
+        Value::timestamptz($t) => {
+            if ($s != Shape::timestamp && $s != Shape::timestamptz) {
+                return .ok(false);
+            }
+            tcp::wire::putBe32($out, 8);
+            tcp::wire::putBe64($out, microsOf($t) as uint64);
+            return .ok(true);
+        },
+        Value::interval($i) => {
+            if ($s != Shape::interval) {
+                return .ok(false);
+            }
+            tcp::wire::putBe32($out, 16);
+            tcp::wire::putBe64($out, $i->micros as uint64);
+            tcp::wire::putBe32($out, $i->days as uint32);
+            tcp::wire::putBe32($out, $i->months as uint32);
+            return .ok(true);
+        },
+        Value::list($items) => {
+            if ($s != Shape::array || !binary($oid)) {
+                return .ok(false);
+            }
+            return binaryArrayOf($items, element($oid), $out);
+        },
+        else => {
+            return .ok(false);
+        },
+    }
+}
+
+/**
+ * JSONB's binary form: a version byte, then the text.
+ */
+internal function jsonb(const string& $text, string& $out) : void
+{
+    tcp::wire::putBe32($out, ($text->size() + 1) as uint32);
+    $out->push(1);
+    $out->append($text);
+}
+
+/**
+ * An array in binary, elements of type `$el`. False when one element has no binary form for it.
+ */
+internal function binaryArrayOf(const array<Value>& $items, uint32 $el, string& $out) : result<bool, pgsql::Error>
+{
+    array<int32> $dims = array<int32>();
+    array<Value> $flat = array<Value>();
+    guard flatten($items, 0, $dims, $flat) else ($e) {
+        return .error($e);
+    }
+    Shape $es = shape($el);
+    string $body = '';
+    bool $nulls = false;
+    string $elements = '';
+    foreach ($flat as const &$item) {
+        if ($item->isNull()) {
+            $nulls = true;
+            tcp::wire::putBe32($elements, NULL_AT);
+            continue;
+        }
+        bool $done = guard binaryOf($item, $es, $el, $elements) else ($e) {
+            return .error($e);
+        }
+        if (!$done) {
+            return .ok(false);
+        }
+    }
+    if ($flat->empty()) {
+        $dims->clear();
+    }
+    tcp::wire::putBe32($body, $dims->count() as uint32);
+    if ($nulls) {
+        tcp::wire::putBe32($body, 1);
+    } else {
+        tcp::wire::putBe32($body, 0);
+    }
+    tcp::wire::putBe32($body, $el);
+    foreach ($dims as $d) {
+        int32 $size = $d;
+        tcp::wire::putBe32($body, $size as uint32);
+        tcp::wire::putBe32($body, 1);
+    }
+    $body->append($elements);
+    tcp::wire::putBe32($out, $body->size() as uint32);
+    $out->append($body);
+    return .ok(true);
+}
+
+/**
+ * The elements of nested lists in row-major order, and the size of each dimension. Every list on
+ * one level has to have the same size.
+ */
+internal function flatten(const array<Value>& $items, usize $depth, array<int32>& $dims, array<Value>& $flat) : status<pgsql::Error>
+{
+    if ($depth >= MAX_DIMENSIONS as usize) {
+        return .error(.invalid('an array deeper than 6 dimensions'));
+    }
+    if ($dims->count() == $depth) {
+        $dims->push($items->count() as int32);
+    } else if (($dims[$depth] as usize) != $items->count()) {
+        return .error(.invalid('a multi-dimensional array whose rows differ in length'));
+    }
+    // a level holds lists or values, never both
+    bool $lists = !$items->empty() && $items[0]->list() != null;
+    foreach ($items as const &$item) {
+        array<Value>? $inner = $item->list();
+        if (($inner != null) != $lists) {
+            return .error(.invalid('a multi-dimensional array mixing lists and values'));
+        }
+        if ($inner != null) {
+            array<Value> $sub = guard $inner;
+            guard flatten($sub, $depth + 1, $dims, $flat) else ($e) {
+                return .error($e);
+            }
+        } else {
+            if ($dims->count() > $depth + 1) {
+                return .error(.invalid('a multi-dimensional array mixing lists and values'));
+            }
+            $flat->push($item);
+        }
+    }
+    return .ok;
+}
+
+internal function daysOf(const Date& $d) : int32
+{
+    if ($d->year == pgsql::INFINITE_YEAR) {
+        return DATE_INFINITY;
+    }
+    if ($d->year == pgsql::PAST_YEAR) {
+        return DATE_PAST;
+    }
+    return ($d->unixDays() - pgsql::PG_EPOCH_DAYS) as int32;
+}
+
+internal function microsOf(const DateTime& $t) : int64
+{
+    if ($t->year == pgsql::INFINITE_YEAR) {
+        return TIMESTAMP_INFINITY;
+    }
+    if ($t->year == pgsql::PAST_YEAR) {
+        return TIMESTAMP_PAST;
+    }
+    return $t->unixMicros() - PG_EPOCH_MICROS;
+}
+
+/**
+ * A value as text the server's input functions read: what a text parameter carries, and what
+ * `"{$value}"` prints.
+ */
+internal function textOf(const Value& $v) : string
+{
+    match ($v) {
+        Value::none => {
+            return 'NULL';
+        },
+        Value::bool($b) => {
+            if ($b) {
+                return 'true';
+            }
+            return 'false';
+        },
+        Value::int($n) => {
+            return str::from($n);
+        },
+        Value::float($f) => {
+            return floatText($f);
+        },
+        Value::numeric($s) => {
+            return $s;
+        },
+        Value::text($s) => {
+            return $s;
+        },
+        Value::bytes($b) => {
+            string $hex = '\\x';
+            $hex->append(crypto::hex($b));
+            return $hex;
+        },
+        Value::json($s) => {
+            return $s;
+        },
+        Value::uuid($u) => {
+            return str::from($u);
+        },
+        Value::date($d) => {
+            return str::from($d);
+        },
+        Value::time($t) => {
+            return str::from($t);
+        },
+        Value::timestamp($t) => {
+            return str::from($t);
+        },
+        Value::timestamptz($t) => {
+            if ($t->infinite()) {
+                return str::from($t);
+            }
+            // the zone goes before an era: 0044-03-15 12:00:00+00 BC
+            string $s = str::from($t);
+            if ($s->ends(' BC')) {
+                string $bc = $s->sub(0, $s->size() - 3);
+                $bc->append('+00 BC');
+                return $bc;
+            }
+            $s->append('+00');
+            return $s;
+        },
+        Value::interval($i) => {
+            return str::from($i);
+        },
+        Value::list($items) => {
+            return arrayText($items, false);
+        },
+    }
+}
+
+/**
+ * The shortest decimal that reads back as `$f`, or `NaN` and the infinities as PostgreSQL spells
+ * them.
+ */
+internal function floatText(float64 $f) : string
+{
+    // from the bits: float comparisons are not IEEE about NaN here
+    uint64 $bits = mem::bit_cast<uint64, float64>($f);
+    if ((($bits >> 52) & 2047) == 2047) {
+        if (($bits & 4503599627370495) != 0) {
+            return 'NaN';
+        }
+        if (($bits >> 63) != 0) {
+            return '-Infinity';
+        }
+        return 'Infinity';
+    }
+    string $short = "{$f:.15g}";
+    if ((str::float($short) ?? 0.0) == $f) {
+        return $short;
+    }
+    return "{$f:.17g}";
+}
+
+/**
+ * A float as the server reads it back exactly: 17 significant digits, one formatting call. For
+ * the wire; `floatText` is the shortest form, for people.
+ */
+internal function floatWire(float64 $f) : string
+{
+    uint64 $bits = mem::bit_cast<uint64, float64>($f);
+    if ((($bits >> 52) & 2047) == 2047) {
+        return floatText($f);
+    }
+    return "{$f:.17g}";
+}
+
+/**
+ * `$n` in decimal, written straight into `$out`.
+ */
+internal function putInt(string& $out, int64 $n) : void
+{
+    if ($n == 0) {
+        $out->push(48);
+        return;
+    }
+    fixed_array<uint8, 20> $d = fixed_array<uint8, 20>();
+    usize $k = 0;
+    uint64 $u = $n as uint64;
+    if ($n < 0) {
+        $out->push(45);
+        $u = (0 - ($n + 1)) as uint64 + 1;
+    }
+    while ($u > 0) {
+        $d[$k] = (48 + $u % 10) as uint8;
+        $u = $u / 10;
+        $k = $k + 1;
+    }
+    while ($k > 0) {
+        $k = $k - 1;
+        $out->push($d[$k]);
+    }
+}
+
+/**
+ * An array literal: `{1,2,NULL}`, each element quoted and escaped, nested lists as nested braces.
+ */
+internal function arrayText(const array<Value>& $items, bool $wire) : string
+{
+    string $out = '{';
+    bool $first = true;
+    foreach ($items as const &$item) {
+        if (!$first) {
+            $out->push(44);
+        }
+        $first = false;
+        if ($item->isNull()) {
+            $out->append('NULL');
+            continue;
+        }
+        array<Value>? $inner = $item->list();
+        if ($inner != null) {
+            array<Value> $sub = guard $inner;
+            $out->append(arrayText($sub, $wire));
+            continue;
+        }
+        string $t = '';
+        if ($wire) {
+            $t = wireText($item);
+        } else {
+            $t = textOf($item);
+        }
+        $out->push(34);
+        usize $i = 0;
+        while ($i < $t->size()) {
+            uint8 $c = $t->byte($i);
+            if ($c == 34 || $c == 92) {
+                $out->push(92);
+            }
+            $out->push($c);
+            $i = $i + 1;
+        }
+        $out->push(34);
+    }
+    $out->push(125);
+    return $out;
+}

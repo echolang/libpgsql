@@ -1,0 +1,87 @@
+/**
+ * `got($db->query(...))`: the value, or the test stops with the error. One name per type: a
+ * string literal inside a call nested in an overloaded one trips the compiler (echoc 0.12.5), and
+ * so does `->unwrap()` on a call's temporary result.
+ */
+
+internal function got(result<pgsql::ResultSet, pgsql::Error> $r) : pgsql::ResultSet
+{
+    pgsql::ResultSet $v = guard $r else ($e) {
+        die("{$e}");
+    }
+    return $v;
+}
+
+internal function did(result<pgsql::Outcome, pgsql::Error> $r) : pgsql::Outcome
+{
+    pgsql::Outcome $v = guard $r else ($e) {
+        die("{$e}");
+    }
+    return $v;
+}
+
+internal function streamed(result<pgsql::Rows, pgsql::Error> $r) : pgsql::Rows
+{
+    pgsql::Rows $v = guard $r else ($e) {
+        die("{$e}");
+    }
+    return $v;
+}
+
+internal function prepared(result<pgsql::Statement, pgsql::Error> $r) : pgsql::Statement
+{
+    pgsql::Statement $v = guard $r else ($e) {
+        die("{$e}");
+    }
+    return $v;
+}
+
+internal function begun(result<pgsql::Transaction, pgsql::Error> $r) : pgsql::Transaction
+{
+    pgsql::Transaction $v = guard $r else ($e) {
+        die("{$e}");
+    }
+    return $v;
+}
+
+internal function gotAll(result<array<pgsql::ResultSet>, pgsql::Error> $r) : array<pgsql::ResultSet>
+{
+    array<pgsql::ResultSet> $v = guard $r else ($e) {
+        die("{$e}");
+    }
+    return $v;
+}
+
+internal function fine(status<pgsql::Error> $s) : void
+{
+    guard $s else ($e) {
+        die("{$e}");
+    }
+}
+
+/**
+ * The error a call had to fail with.
+ */
+internal function failsQuery(result<pgsql::ResultSet, pgsql::Error> $r) : pgsql::Error
+{
+    if (!$r->failed()) {
+        die('expected an error');
+    }
+    return $r->failure();
+}
+
+internal function failsExec(result<pgsql::Outcome, pgsql::Error> $r) : pgsql::Error
+{
+    if (!$r->failed()) {
+        die('expected an error');
+    }
+    return $r->failure();
+}
+
+internal function failsStatus(status<pgsql::Error> $s) : pgsql::Error
+{
+    if (!$s->failed()) {
+        die('expected an error');
+    }
+    return $s->failure();
+}

@@ -1,0 +1,4 @@
+test version_is_set
+{
+    assert(pgsql::VERSION == '0.1.0');
+}

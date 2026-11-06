@@ -1,0 +1,96 @@
+use std::time;
+
+test url_with_everything
+{
+    pgsql::Options $o = pgsql::Options::parse('postgres://app:s3cret@db.example:6543/shop?sslmode=disable&application_name=api&connect_timeout=3&timeout=250ms&statement_cache=8&max_message=4096&max_protocol_version=3.2&allow_cleartext=true&cancel_wait=1s')->unwrap();
+    assert($o->user == 'app');
+    assert($o->password == 's3cret');
+    assert($o->host == 'db.example');
+    assert($o->port == 6543);
+    assert(($o->database ?? '') == 'shop');
+    assert($o->sslmode == pgsql::SslMode::disable);
+    assert($o->applicationName == 'api');
+    assert($o->connectTimeout == time::duration::secs(3));
+    assert(($o->timeout ?? time::duration::secs(0)) == time::duration::millis(250));
+    assert($o->cancelWait == time::duration::secs(1));
+    assert($o->statementCache == 8);
+    assert($o->maxMessage == 4096);
+    assert($o->protocol == pgsql::Protocol::v3_2);
+    assert($o->allowCleartext);
+}
+
+test url_defaults
+{
+    pgsql::Options $o = pgsql::Options::parse('postgresql://')->unwrap();
+    assert($o->host == '127.0.0.1');
+    assert($o->port == 5432);
+    assert($o->user == 'postgres');
+    assert($o->database == null);
+    assert($o->sslmode == pgsql::SslMode::prefer);
+    assert($o->protocol == pgsql::Protocol::v3_0);
+    assert(!$o->allowCleartext);
+}
+
+test url_percent_decodes_and_takes_the_last_at
+{
+    pgsql::Options $o = pgsql::Options::parse('postgres://us%40er:p@ss:w%2Fd@host/my%20db')->unwrap();
+    assert($o->user == 'us@er');
+    assert($o->password == 'p@ss:w/d');
+    assert(($o->database ?? '') == 'my db');
+}
+
+test url_ipv6_host
+{
+    pgsql::Options $o = pgsql::Options::parse('postgres://[::1]:5433/x')->unwrap();
+    assert($o->host == '::1');
+    assert($o->port == 5433);
+}
+
+test url_unix_socket_by_host
+{
+    pgsql::Options $q = pgsql::Options::parse('postgres:///shop?host=/var/run/postgresql')->unwrap();
+    assert(($q->socket ?? '') == '/var/run/postgresql');
+    assert(($q->socketPath() ?? '') == '/var/run/postgresql/.s.PGSQL.5432');
+    pgsql::Options $p = pgsql::Options::parse('postgres://%2Ftmp:5433/shop')->unwrap();
+    assert(($p->socketPath() ?? '') == '/tmp/.s.PGSQL.5433');
+    pgsql::Options $f = pgsql::Options::parse('postgres:///?host=/tmp/.s.PGSQL.9999')->unwrap();
+    assert(($f->socketPath() ?? '') == '/tmp/.s.PGSQL.9999');
+    assert(pgsql::Options()->socketPath() == null);
+}
+
+test url_query_keys_like_libpq
+{
+    pgsql::Options $o = pgsql::Options::parse('postgres://h/?user=u&password=p&dbname=d&port=1234&options=-c%20search_path%3Dapp')->unwrap();
+    assert($o->user == 'u');
+    assert($o->password == 'p');
+    assert(($o->database ?? '') == 'd');
+    assert($o->port == 1234);
+    assert($o->settings['options'] == '-c search_path=app');
+}
+
+test url_refusals
+{
+    assert(pgsql::Options::parse('mysql://x')->failed());
+    assert(pgsql::Options::parse('postgres://h:0')->failed());
+    assert(pgsql::Options::parse('postgres://h:70000')->failed());
+    assert(pgsql::Options::parse('postgres://h:abc')->failed());
+    assert(pgsql::Options::parse('postgres://[::1/x')->failed());
+    assert(pgsql::Options::parse('postgres://a,b/x')->failed());
+    assert(pgsql::Options::parse('postgres://h/x?sslmode=sometimes')->failed());
+    assert(pgsql::Options::parse('postgres://h/x?nope=1')->failed());
+    assert(pgsql::Options::parse('postgres://h/x?timeout=soon')->failed());
+    assert(pgsql::Options::parse('postgres://h/x?max_message=10')->failed());
+    assert(pgsql::Options::parse('postgres://h/x?max_protocol_version=4')->failed());
+    assert(pgsql::Options::parse('postgres://h/%zz')->failed());
+    assert(pgsql::Options::parse('postgres://h/x?allow_cleartext=maybe')->failed());
+    pgsql::Error $e = pgsql::Options::parse('postgres://h/x?nope=1')->failure();
+    assert($e->name() == 'invalid');
+}
+
+test sslmode_names
+{
+    assert((pgsql::SslMode::named('verify-full') ?? pgsql::SslMode::disable) == pgsql::SslMode::verifyFull);
+    assert((pgsql::SslMode::named('verify-ca') ?? pgsql::SslMode::disable)->needsTls());
+    assert(!(pgsql::SslMode::named('prefer') ?? pgsql::SslMode::require)->needsTls());
+    assert(pgsql::SslMode::named('VERIFY') == null);
+}

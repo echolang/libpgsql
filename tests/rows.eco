@@ -1,0 +1,211 @@
+/**
+ * Rows from both readers: `decodeRow` (one walk, every value) and `layout` with `Cell` (what
+ * `RowView` reads in place) must agree on every value of random rows, and refuse every short or
+ * corrupted row without reading past it.
+ */
+
+namespace pgsql::protocol;
+
+use pgsql::{Value, Column, Columns, PgType};
+
+/**
+ * A small deterministic generator, so a failure repeats.
+ */
+internal class Dice
+{
+    internal uint64 $state = 88172645463325252;
+
+    internal function next(uint64 $below) : uint64
+    {
+        $this->state = $this->state ^ ($this->state << 13);
+        $this->state = $this->state ^ ($this->state >> 7);
+        $this->state = $this->state ^ ($this->state << 17);
+        return $this->state % $below;
+    }
+}
+
+// the column types the rows are made of, with whether each arrives in binary
+internal function kinds() : array<uint32>
+{
+    return [OID_INT4, OID_INT8, OID_TEXT, OID_FLOAT8, OID_TIMESTAMPTZ, OID_NUMERIC, OID_BOOL, OID_DATE, OID_INTERVAL, 1007, OID_UUID];
+}
+
+/**
+ * A value of type `$oid` in the form it travels in: binary unless it is a numeric.
+ */
+internal function sample(Dice $d, uint32 $oid) : string
+{
+    if ($oid == OID_INT4) {
+        return be32($d->next(4294967295) as uint32);
+    }
+    if ($oid == OID_INT8 || $oid == OID_FLOAT8 || $oid == OID_TIMESTAMPTZ) {
+        string $b = '';
+        tcp::wire::putBe64($b, $d->next(18446744073709551615));
+        return $b;
+    }
+    if ($oid == OID_TEXT) {
+        return str::repeat('x', $d->next(40) as usize);
+    }
+    if ($oid == OID_NUMERIC) {
+        uint64 $n = $d->next(100000);
+        return "{$n}.25";
+    }
+    if ($oid == OID_BOOL) {
+        string $b = '';
+        $b->push($d->next(2) as uint8);
+        return $b;
+    }
+    if ($oid == OID_DATE) {
+        return be32(($d->next(200000) as uint32) - 100000);
+    }
+    if ($oid == OID_INTERVAL) {
+        string $i = '';
+        tcp::wire::putBe64($i, $d->next(100000000000));
+        $i->append(be32($d->next(1000) as uint32));
+        $i->append(be32($d->next(100) as uint32));
+        return $i;
+    }
+    if ($oid == 1007) {
+        // a one-dimensional int4[] of up to three elements
+        uint64 $n = $d->next(4);
+        string $a = '';
+        $a->append(be32(1));
+        $a->append(be32(0));
+        $a->append(be32(OID_INT4));
+        $a->append(be32($n as uint32));
+        $a->append(be32(1));
+        uint64 $k = 0;
+        while ($k < $n) {
+            $a->append(be32(4));
+            $a->append(be32($d->next(1000) as uint32));
+            $k = $k + 1;
+        }
+        return $a;
+    }
+    string $u = '';
+    while ($u->size() < 16) {
+        $u->push($d->next(256) as uint8);
+    }
+    return $u;
+}
+
+internal function columnsOf(const array<uint32>& $oids) : Columns
+{
+    array<Column> $list = array<Column>();
+    foreach ($oids as $i => $oid) {
+        int16 $f = BINARY;
+        if (!binary($oid)) {
+            $f = TEXT;
+        }
+        $list->push(Column("c{$i}", 0, 0, PgType::from($oid), -1, -1, $f));
+    }
+    return Columns($list);
+}
+
+test both_readers_agree_on_random_rows
+{
+    Dice $d = Dice();
+    array<uint32> $types = kinds();
+    int32 $round = 0;
+    while ($round < 300) {
+        usize $n = ($d->next(12) + 1) as usize;
+        array<uint32> $oids = array<uint32>();
+        string $row = '';
+        tcp::wire::putBe16($row, $n as uint16);
+        usize $i = 0;
+        while ($i < $n) {
+            uint32 $oid = $types[$d->next($types->count() as uint64) as usize];
+            $oids->push($oid);
+            if ($d->next(6) == 0) {
+                tcp::wire::putBe32($row, NULL_AT);
+            } else {
+                string $v = sample($d, $oid);
+                tcp::wire::putBe32($row, $v->size() as uint32);
+                $row->append($v);
+            }
+            $i = $i + 1;
+        }
+        Columns $cols = columnsOf($oids);
+        array<Value> $whole = array<Value>();
+        guard decodeRow($row, $cols, $whole) else ($e) {
+            die("decodeRow: {$e}");
+        }
+        array<uint32> $starts = array<uint32>();
+        array<uint32> $sizes = array<uint32>();
+        guard layout($row, $cols, $starts, $sizes) else ($e) {
+            die("layout: {$e}");
+        }
+        assert($whole->count() == $n);
+        foreach ($whole as $k => const &$v) {
+            if ($starts[$k] == NULL_AT) {
+                assert($v->isNull());
+                continue;
+            }
+            Cell $c = Cell($row->view()->sub($starts[$k] as usize, $sizes[$k] as usize), $cols->shapes[$k], $cols->binary[$k], $oids[$k]);
+            Value $one = guard $c->value() else ($e) {
+                die("cell: {$e}");
+            }
+            assert("{$one}" == "{$v}");
+            // the typed reads say what the value says
+            assert(($c->int() ?? 0) == ($v->int() ?? 0));
+            assert(($c->bool() ?? false) == ($v->bool() ?? false));
+            if ($v->kind() == 'timestamptz') {
+                assert("{$c->datetime() ?? pgsql::DateTime()}" == "{$v->datetime() ?? pgsql::DateTime()}");
+            }
+            if ($v->kind() == 'text') {
+                assert(string($c->text() ?? '') == ($v->text() ?? '?'));
+            }
+        }
+
+        // every shorter row is refused by both
+        usize $cut = 0;
+        while ($cut < $row->size()) {
+            string $short = $row->sub(0, $cut);
+            array<Value> $none = array<Value>();
+            assert(decodeRow($short, $cols, $none)->failed());
+            assert(layout($short, $cols, $starts, $sizes)->failed());
+            $cut = $cut + 1 + ($d->next(3) as usize);
+        }
+        // and so is one with a byte too many
+        string $long = $row;
+        $long->push(0);
+        array<Value> $more = array<Value>();
+        assert(decodeRow($long, $cols, $more)->failed());
+        $round = $round + 1;
+    }
+}
+
+test random_bytes_never_read_past_the_row
+{
+    Dice $d = Dice();
+    array<uint32> $oids = [OID_INT4, OID_TEXT, 1007];
+    Columns $cols = columnsOf($oids);
+    int32 $round = 0;
+    while ($round < 2000) {
+        string $junk = '';
+        tcp::wire::putBe16($junk, 3);
+        uint64 $len = $d->next(40);
+        uint64 $k = 0;
+        while ($k < $len) {
+            $junk->push($d->next(256) as uint8);
+            $k = $k + 1;
+        }
+        array<Value> $out = array<Value>();
+        // either it decodes or it is refused; it never reads outside the bytes
+        status<pgsql::Error> $s = decodeRow($junk, $cols, $out);
+        if ($s->failed()) {
+            assert($s->failure()->name() == 'malformed');
+        }
+        $round = $round + 1;
+    }
+}
+
+test a_row_with_the_wrong_value_count_is_refused
+{
+    array<uint32> $oids = [OID_INT4];
+    Columns $cols = columnsOf($oids);
+    string $row = '';
+    tcp::wire::putBe16($row, 2);
+    array<Value> $out = array<Value>();
+    assert(decodeRow($row, $cols, $out)->failure()->message()->contains('2 values for 1 columns'));
+}

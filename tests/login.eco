@@ -1,0 +1,356 @@
+/**
+ * Logins against the scripted server: every authentication method, the startup message, protocol
+ * negotiation, and what the server reports before it is ready.
+ */
+
+use pgsql::protocol::{AUTH, PASSWORD, ERROR, SYNC, TERMINATE, NOTICE, PARAMETER_STATUS, NEGOTIATE, BACKEND_KEY, READY, PROTOCOL_3_0, PROTOCOL_3_2};
+use std::time;
+
+test trust_login_reports_version_key_and_settings
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Startup $st = $w->welcome();
+        assert($st->protocol == PROTOCOL_3_0);
+        assert($st->params['user'] == 'app');
+        assert($st->params['database'] == 'shop');
+        assert($st->params['client_encoding'] == 'UTF8');
+        assert($st->params['DateStyle'] == 'ISO, MDY');
+        assert($st->params['extra_float_digits'] == '3');
+        assert($st->params['search_path'] == 'app,public');
+        assert($st->params['application_name'] == 'tests');
+        $w->expect(TERMINATE);
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->settings['search_path'] = 'app,public';
+    $o->applicationName = 'tests';
+    pgsql::Connection $db = login($o);
+    assert($db->server == '18.0');
+    assert($db->key->pid == 4242);
+    assert($db->key->secret == 'k3y!');
+    assert(($db->setting('TimeZone') ?? '') == 'UTC');
+    assert($db->setting('nope') == null);
+    assert(!$db->inTransaction());
+    $db->close();
+    assert(!$db->alive());
+    $db->close();
+    $f->server->join();
+}
+
+test no_database_and_no_application_name_send_nothing
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Startup $st = $w->welcome();
+        assert(!$st->params->has('database'));
+        assert(!$st->params->has('application_name'));
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->database = null;
+    login($o)->close();
+    $f->server->join();
+}
+
+test md5_login
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        string $salt = 'abcd';
+        $w->send(AUTH, auth(5, $salt));
+        string $answer = $w->expect(PASSWORD);
+        string $want = pgsql::auth::md5('app', 'secret', $salt);
+        $want->push(0);
+        assert($answer == $want);
+        $w->letIn();
+        $w->bye();
+    });
+    login($f)->close();
+    $f->server->join();
+}
+
+test md5_with_a_bad_salt_is_malformed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(5, 'abc'));
+        $w->bye();
+    });
+    result<pgsql::Connection, pgsql::Error> $r = pgsql::Connection::open(optionsFor($f));
+    assert($r->failure()->name() == 'malformed');
+    $f->server->join();
+}
+
+test scram_login
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        ScramServer $s = ScramServer('secret');
+        assert($s->run($w));
+        $w->letIn();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    assert($db->alive());
+    $db->close();
+    $f->server->join();
+}
+
+test scram_with_the_wrong_password_hears_the_server_refuse
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        ScramServer $s = ScramServer('other');
+        assert(!$s->run($w));
+        $w->error('28P01', 'password authentication failed for user "app"');
+        $w->bye();
+    });
+    pgsql::Error $e = pgsql::Connection::open(optionsFor($f))->failure();
+    assert($e->is(.invalidPassword));
+    assert(($e->state() ?? '') == '28P01');
+    $f->server->join();
+}
+
+test scram_server_that_does_not_know_the_password_is_refused
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        ScramServer $s = ScramServer('secret');
+        assert($s->run($w, true));
+        $w->bye();
+    });
+    pgsql::Error $e = pgsql::Connection::open(optionsFor($f))->failure();
+    assert($e->name() == 'auth');
+    assert($e->message()->contains('server signature is wrong'));
+    $f->server->join();
+}
+
+test sasl_without_scram_sha_256_is_unsupported
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        string $offer = '';
+        pgsql::protocol::putCString($offer, 'OAUTHBEARER');
+        $offer->push(0);
+        $w->send(AUTH, auth(10, $offer));
+        $w->bye();
+    });
+    pgsql::Error $e = pgsql::Connection::open(optionsFor($f))->failure();
+    assert($e->name() == 'auth');
+    assert($e->message()->contains('OAUTHBEARER'));
+    $f->server->join();
+}
+
+test gss_kerberos_and_sspi_are_unsupported
+{
+    array<uint32> $codes = [2, 7, 9, 99];
+    foreach ($codes as $code) {
+        uint32 $c = $code;
+        Fake $f = fake(function(Wire $w) : void {
+            $w->startup();
+            $w->send(AUTH, auth($c, ''));
+            $w->bye();
+        });
+        pgsql::Error $e = pgsql::Connection::open(optionsFor($f))->failure();
+        assert($e->name() == 'auth');
+        $f->server->join();
+    }
+}
+
+test cleartext_over_tcp_is_refused_unless_allowed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(3, ''));
+        $w->bye();
+    });
+    pgsql::Error $e = pgsql::Connection::open(optionsFor($f))->failure();
+    assert($e->message()->contains('allowCleartext'));
+    $f->server->join();
+
+    Fake $g = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(3, ''));
+        assert($w->expect(PASSWORD) == "secret\0");
+        $w->letIn();
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($g);
+    $o->allowCleartext = true;
+    login($o)->close();
+    $g->server->join();
+}
+
+#[if: os != windows]
+test cleartext_over_a_unix_socket_is_fine
+{
+    int32 $pid = std::env::pid();
+    string $path = "/tmp/.s.PGSQL.{$pid}";
+    Fake $f = fakeUnix($path, function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(3, ''));
+        assert($w->expect(PASSWORD) == "secret\0");
+        $w->letIn();
+        $w->bye();
+    });
+    pgsql::Options $o = pgsql::Options($user: 'app', $password: 'secret');
+    $o->socket = $path;
+    login($o)->close();
+    $f->server->join();
+}
+#[end]
+
+test login_error_is_the_servers
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->error('3D000', 'database "shop" does not exist');
+        $w->bye();
+    });
+    pgsql::Error $e = pgsql::Connection::open(optionsFor($f))->failure();
+    assert($e->is(.invalidCatalogName));
+    assert(($e->server()?->message ?? '') == 'database "shop" does not exist');
+    $f->server->join();
+}
+
+test protocol_3_2_falls_back_when_the_server_negotiates
+{
+    Fake $f = fake(function(Wire $w) : void {
+        Startup $st = $w->startup();
+        assert($st->protocol == PROTOCOL_3_2);
+        string $n = '';
+        tcp::wire::putBe32($n, 0);
+        tcp::wire::putBe32($n, 0);
+        $w->send(NEGOTIATE, $n);
+        $w->letIn();
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->protocol = pgsql::Protocol::v3_2;
+    pgsql::Connection $db = login($o);
+    assert($db->protocol == PROTOCOL_3_0);
+    $db->close();
+    $f->server->join();
+}
+
+test protocol_3_2_takes_a_long_cancel_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(0, ''));
+        $w->send(BACKEND_KEY, backendKey(7, str::repeat('k', 32)));
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->protocol = pgsql::Protocol::v3_2;
+    pgsql::Connection $db = login($o);
+    assert($db->protocol == PROTOCOL_3_2);
+    assert($db->key->secret->size() == 32);
+    $db->close();
+    $f->server->join();
+}
+
+test a_bad_cancel_key_or_message_is_malformed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(0, ''));
+        $w->send(BACKEND_KEY, backendKey(7, 'ab'));
+        $w->bye();
+    });
+    assert(pgsql::Connection::open(optionsFor($f))->failure()->name() == 'malformed');
+    $f->server->join();
+
+    Fake $g = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(0, ''));
+        $w->send(122, 'zzz');
+        $w->bye();
+    });
+    assert(pgsql::Connection::open(optionsFor($g))->failure()->name() == 'malformed');
+    $g->server->join();
+}
+
+test a_message_over_max_message_is_too_large
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->send(AUTH, auth(0, ''));
+        $w->send(PARAMETER_STATUS, setting('big', str::repeat('x', 5000)));
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->maxMessage = 2048;
+    assert(pgsql::Connection::open($o)->failure()->name() == 'tooLarge');
+    $f->server->join();
+}
+
+test sslmode_that_needs_tls_is_refused_up_front
+{
+    pgsql::Options $o = pgsql::Options();
+    $o->sslmode = pgsql::SslMode::require;
+    pgsql::Error $e = pgsql::Connection::open($o)->failure();
+    assert($e->name() == 'invalid');
+    assert($e->message()->contains('TLS'));
+}
+
+test nobody_listening_is_a_transport_error
+{
+    tcp::Listener $l = tcp::Listener::bind(tcp::Address(loopback: 0))->unwrap();
+    uint16 $port = $l->local->port;
+    $l->close();
+    pgsql::Options $o = pgsql::Options();
+    $o->port = $port;
+    assert(pgsql::Connection::open($o)->failure()->name() == 'transport');
+}
+
+test a_server_that_never_answers_times_out
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->startup();
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->connectTimeout = time::duration::millis(200);
+    assert(pgsql::Connection::open($o)->failure()->name() == 'timeout');
+    $f->server->join();
+}
+
+test ping_settings_and_notices_on_the_way
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(SYNC);
+        $w->send(NOTICE, errorFields('WARNING', '01000', 'careful'));
+        $w->send(PARAMETER_STATUS, setting('TimeZone', 'Europe/Zurich'));
+        $w->send(65, 'ignored notification');
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    rc<array<string>> $box = rc<array<string>>(array<string>());
+    $db->onNotice(function(pgsql::ServerError $n) : void {
+        $box->value->push("{$n}");
+    });
+    guard $db->ping() else ($e) {
+        die("ping: {$e}");
+    }
+    assert(($db->setting('TimeZone') ?? '') == 'Europe/Zurich');
+    assert($box->value->count() == 1);
+    assert($box->value[0] == 'WARNING 01000: careful');
+    $db->close();
+    assert($db->ping()->failure()->name() == 'closed');
+    $f->server->join();
+}
+
+test the_server_hanging_up_is_a_transport_error
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(SYNC);
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Error $e = $db->ping()->failure();
+    assert($e->name() == 'transport');
+    assert(!$db->alive());
+    $f->server->join();
+}

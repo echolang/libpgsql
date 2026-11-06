@@ -1,0 +1,207 @@
+/**
+ * `str::from` for this library's types, so `"{$e}"`, `"{$value}"` and `"{$date}"` work. They
+ * write what the server's input functions read back. Own file: a namespace is a property of the
+ * file.
+ */
+
+namespace pgsql;
+
+/**
+ * `$v` in decimal, zero padded on the left to `$width` digits.
+ */
+internal function padded(uint64 $v, usize $width) : string
+{
+    return str::lpad(str::from($v), $width, 48);
+}
+
+/**
+ * `.ffffff` without its trailing zeros, nothing for zero.
+ */
+internal function micros(uint32 $micro) : string
+{
+    if ($micro == 0) {
+        return '';
+    }
+    string $digits = padded($micro as uint64, 6);
+    usize $end = 6;
+    while ($end > 1 && $digits->byte($end - 1) == 48) {
+        $end = $end - 1;
+    }
+    string $out = '.';
+    $out->append($digits->sub(0, $end));
+    return $out;
+}
+
+/**
+ * `HH:MM:SS[.ffffff]`.
+ */
+internal function clock(uint64 $hours, uint8 $minute, uint8 $second, uint32 $micro) : string
+{
+    string $out = padded($hours, 2);
+    $out->push(58);
+    $out->append(padded($minute as uint64, 2));
+    $out->push(58);
+    $out->append(padded($second as uint64, 2));
+    $out->append(micros($micro));
+    return $out;
+}
+
+/**
+ * `YYYY-MM-DD`, the era left to the caller.
+ */
+internal function dayText(int32 $year, uint8 $month, uint8 $day) : string
+{
+    int64 $y = $year as int64;
+    if ($y <= 0) {
+        $y = 1 - $y;
+    }
+    string $out = padded($y as uint64, 4);
+    $out->push(45);
+    $out->append(padded($month as uint64, 2));
+    $out->push(45);
+    $out->append(padded($day as uint64, 2));
+    return $out;
+}
+
+/**
+ * `3 days`, `1 day`, `-1 days`.
+ */
+internal function unit(int64 $n, const string& $one, const string& $many) : string
+{
+    if ($n == 1) {
+        return "{$n} {$one}";
+    }
+    return "{$n} {$many}";
+}
+
+namespace str;
+
+/**
+ * `"{$e}"`: the sentence.
+ */
+public function from(const pgsql::Error& $e) : string
+{
+    return $e->message();
+}
+
+/**
+ * `"{$e}"`: `SEVERITY state: message`.
+ */
+public function from(const pgsql::ServerError& $e) : string
+{
+    return "{$e->severity} {$e->state}: {$e->message}";
+}
+
+/**
+ * `YYYY-MM-DD`, ` BC` after a year before 1, `infinity`, `-infinity`.
+ */
+public function from(const pgsql::Date& $d) : string
+{
+    if ($d->year == pgsql::INFINITE_YEAR) {
+        return 'infinity';
+    }
+    if ($d->year == pgsql::PAST_YEAR) {
+        return '-infinity';
+    }
+    string $out = pgsql::dayText($d->year, $d->month, $d->day);
+    if ($d->year <= 0) {
+        $out->append(' BC');
+    }
+    return $out;
+}
+
+/**
+ * `HH:MM:SS`, with `.ffffff` when there are microseconds.
+ */
+public function from(const pgsql::Time& $t) : string
+{
+    return pgsql::clock($t->hour as uint64, $t->minute, $t->second, $t->micro);
+}
+
+/**
+ * `YYYY-MM-DD HH:MM:SS[.ffffff]`, ` BC` after a year before 1, `infinity`, `-infinity`.
+ */
+public function from(const pgsql::DateTime& $t) : string
+{
+    if ($t->year == pgsql::INFINITE_YEAR) {
+        return 'infinity';
+    }
+    if ($t->year == pgsql::PAST_YEAR) {
+        return '-infinity';
+    }
+    string $out = pgsql::dayText($t->year, $t->month, $t->day);
+    $out->push(32);
+    $out->append(pgsql::clock($t->hour as uint64, $t->minute, $t->second, $t->micro));
+    if ($t->year <= 0) {
+        $out->append(' BC');
+    }
+    return $out;
+}
+
+/**
+ * The `postgres` interval style: `1 year 2 mons 3 days 04:05:06.5`, `00:00:00` for nothing.
+ */
+public function from(const pgsql::Interval& $i) : string
+{
+    array<string> $parts = array<string>();
+    int64 $years = ($i->months / 12) as int64;
+    int64 $mons = ($i->months % 12) as int64;
+    bool $negative = false;
+    if ($years != 0) {
+        $parts->push(pgsql::unit($years, 'year', 'years'));
+        $negative = $years < 0;
+    }
+    if ($mons != 0) {
+        $parts->push(pgsql::unit($mons, 'mon', 'mons'));
+        $negative = $mons < 0;
+    }
+    if ($i->days != 0) {
+        $parts->push(pgsql::unit($i->days as int64, 'day', 'days'));
+        $negative = $i->days < 0;
+    }
+    if ($i->micros != 0 || $parts->empty()) {
+        int64 $us = $i->micros;
+        string $sign = '';
+        if ($us < 0) {
+            $sign = '-';
+            $us = 0 - $us;
+        } else if ($negative) {
+            $sign = '+';
+        }
+        uint64 $secs = ($us / 1000000) as uint64;
+        string $c = pgsql::clock($secs / 3600, (($secs / 60) % 60) as uint8, ($secs % 60) as uint8, ($us % 1000000) as uint32);
+        $sign->append($c);
+        $parts->push($sign);
+    }
+    return str::join($parts, ' ');
+}
+
+/**
+ * `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`.
+ */
+public function from(const pgsql::Uuid& $u) : string
+{
+    string $hex = crypto::hex($u->bytes);
+    if ($hex->size() != 32) {
+        return $hex;
+    }
+    string $out = $hex->sub(0, 8);
+    $out->push(45);
+    $out->append($hex->sub(8, 4));
+    $out->push(45);
+    $out->append($hex->sub(12, 4));
+    $out->push(45);
+    $out->append($hex->sub(16, 4));
+    $out->push(45);
+    $out->append($hex->sub(20, 12));
+    return $out;
+}
+
+/**
+ * `"{$value}"`: the value as a text parameter carries it. `NULL` for SQL NULL, an array literal
+ * for a list.
+ */
+public function from(const pgsql::Value& $v) : string
+{
+    return pgsql::protocol::textOf($v);
+}

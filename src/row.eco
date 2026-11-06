@@ -1,0 +1,184 @@
+namespace pgsql;
+
+/**
+ * One row of a result: its values, and the columns it shares with every other row of the result.
+ * `$row['name']` and `$row[0]` read a value, and `foreach ($row as $name => $value)` walks them.
+ *
+ * A row keeps its message as the server sent it and is decoded whole when it is read, in one
+ * pass; a text value shares the row's bytes instead of copying them. `RowView` is the lazy reader.
+ */
+public struct Row : contract::const_iterable<const Value>
+{
+    public const Columns $columns;
+    // shared by every copy of the row, so a copy is one retain
+    internal RowData $data;
+
+    public const function count() : usize
+    {
+        return $this->data->values->count();
+    }
+
+    /**
+     * The value of the column called `$name`, or null when the result has no such column.
+     */
+    public const function get(const string& $name) : Value?
+    {
+        usize $at = guard $this->columns->find($name) else {
+            return null;
+        }
+        Value? $v = $this->data->values[$at];
+        return $v;
+    }
+
+    public const function iterate() : RowCursor
+    {
+        return RowCursor($this->columns, $this->data->values->sub(), 0);
+    }
+
+    /**
+     * A row of its own, copied out of `$packet`. The connection is about to reuse that buffer.
+     */
+    internal static function read(string::view $packet, Columns $columns) : result<Row, Error>
+    {
+        Row $r = Row($columns, RowData());
+        guard $r->load($packet) else ($e) {
+            return .error($e);
+        }
+        return .ok($r);
+    }
+
+    /**
+     * Stand on `$packet`, another row of the same result. Reuses storage when nothing else holds
+     * this row: last values go first so their bytes are ours again, then the new ones copy into
+     * the room they leave. A row someone kept is left alone.
+     */
+    internal function load(string::view $packet) : status<Error>
+    {
+        if (mem::refs($this->data) > 1) {
+            $this->data = RowData();
+        }
+        RowData $d = $this->data;
+        $d->values->clear();
+        $d->packet->clear();
+        $d->packet->append($packet->bytes, $packet->size);
+        $d->values->reserve($this->columns->count());
+        guard pgsql::protocol::decodeRow($d->packet, $this->columns, $d->values) else ($e) {
+            $d->values->clear();
+            return .error($e);
+        }
+        return .ok;
+    }
+}
+
+/**
+ * What a row holds: the message as the server sent it, and the values decoded from it. Text
+ * values share the message's bytes.
+ */
+internal class RowData
+{
+    internal string $packet = '';
+    internal array<Value> $values = array<Value>();
+}
+
+/**
+ * What `foreach` walks a row with: column name as the key, value as the element.
+ */
+public struct RowCursor : contract::iterator<const Value>, contract::keyed<string>
+{
+    internal Columns $columns;
+    internal slice<const Value> $values;
+    internal usize $at;
+
+    public function advance() : bool
+    {
+        if ($this->at >= $this->values->count()) {
+            return false;
+        }
+        $this->at = $this->at + 1;
+        return true;
+    }
+
+    public function current() : const Value&
+    {
+        return $this->values->at($this->at - 1);
+    }
+
+    public function key() : string
+    {
+        return $this->columns->list[$this->at - 1]->name;
+    }
+}
+
+/**
+ * The value of column `$name`. A missing name stops the program, release build included: that is
+ * a bug in the code. `get` is the lookup that cannot stop.
+ */
+operator (const Row& $r)[const string& $name] : const Value&
+{
+    usize $at = guard $r->columns->find($name) else {
+        string $has = str::join($r->columns->names(), ', ');
+        die("pgsql::Row has no column '{$name}' (it has: {$has})");
+    }
+    return $r->data->values[$at];
+}
+
+/**
+ * The value at position `$at`. Past the last column stops the program, release build included.
+ */
+operator (const Row& $r)[usize $at] : const Value&
+{
+    if ($at >= $r->data->values->count()) {
+        die("pgsql::Row has {$r->data->values->count()} columns, not {$at + 1}");
+    }
+    return $r->data->values[$at];
+}
+
+/**
+ * A whole result, read into memory: columns, rows, and how it ended.
+ */
+public struct ResultSet : contract::iterable<const Row>, contract::const_iterable<const Row>
+{
+    public const Columns $columns;
+    public const array<Row> $rows;
+    public const Outcome $outcome;
+
+    public const function count() : usize
+    {
+        return $this->rows->count();
+    }
+
+    public const function empty() : bool
+    {
+        return $this->rows->empty();
+    }
+
+    public const function first() : Row?
+    {
+        if ($this->rows->empty()) {
+            return null;
+        }
+        Row? $r = $this->rows[0];
+        return $r;
+    }
+
+    public function iterate() : slice_iterator<const Row>
+    {
+        return slice_iterator<const Row>($this->rows->sub());
+    }
+
+    public const function iterate() : slice_iterator<const Row>
+    {
+        return slice_iterator<const Row>($this->rows->sub());
+    }
+}
+
+/**
+ * The row at `$at`. Past the last row stops the program, in a release build too.
+ */
+operator (const ResultSet& $rs)[usize $at] : const Row&
+{
+    if ($at >= $rs->rows->count()) {
+        die("pgsql::ResultSet has {$rs->rows->count()} rows, not {$at + 1}");
+    }
+    return $rs->rows[$at];
+}

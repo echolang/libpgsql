@@ -1,0 +1,264 @@
+/**
+ * The messages a server sends, parsed from their bodies. Every parser takes the body in place and
+ * hands back owned values: the bytes under the view belong to the connection's buffer.
+ */
+
+namespace pgsql::protocol;
+
+/**
+ * One message off the wire: its type byte and its body, in place until the next read.
+ */
+internal struct Message
+{
+    internal uint8 $type;
+    internal string::view $body;
+}
+
+/**
+ * An authentication request: its code, and what follows it (a salt, a list of mechanisms, SASL
+ * data).
+ */
+internal struct AuthRequest
+{
+    internal uint32 $code;
+    internal string $data;
+}
+
+internal function authRequest(string::view $body) : result<AuthRequest, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    uint32 $code = guard $c->u32() else ($e) {
+        return .error($e);
+    }
+    return .ok(AuthRequest($code, $c->rest()));
+}
+
+/**
+ * The mechanisms an AuthenticationSASL request offers: NUL-terminated names, then an empty one.
+ */
+internal function mechanisms(const string& $data) : result<array<string>, pgsql::Error>
+{
+    array<string> $out = array<string>();
+    Cursor $c = Cursor($data);
+    while (true) {
+        string $m = guard $c->cstring() else ($e) {
+            return .error($e);
+        }
+        if ($m->empty()) {
+            return .ok($out);
+        }
+        $out->push($m);
+    }
+}
+
+/**
+ * BackendKeyData: the process id and the secret a cancel request has to show. 4 bytes of secret
+ * in protocol 3.0, up to 256 in 3.2.
+ */
+internal function backendKey(string::view $body) : result<pgsql::CancelKey, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    uint32 $pid = guard $c->u32() else ($e) {
+        return .error($e);
+    }
+    string $secret = $c->rest();
+    if ($secret->size() < 4 || $secret->size() > 256) {
+        return .error(.malformed("a cancel key of {$secret->size()} bytes"));
+    }
+    return .ok(pgsql::CancelKey($pid, $secret));
+}
+
+/**
+ * ParameterStatus: a run-time parameter's name and its current value.
+ */
+internal struct Setting
+{
+    internal string $name;
+    internal string $value;
+}
+
+internal function parameterStatus(string::view $body) : result<Setting, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    string $name = guard $c->cstring() else ($e) {
+        return .error($e);
+    }
+    string $value = guard $c->cstring() else ($e) {
+        return .error($e);
+    }
+    return .ok(Setting($name, $value));
+}
+
+/**
+ * ReadyForQuery: the transaction status, `I`, `T` or `E`.
+ */
+internal function readyStatus(string::view $body) : result<uint8, pgsql::Error>
+{
+    if ($body->size != 1) {
+        return .error(.malformed("ReadyForQuery of {$body->size} bytes"));
+    }
+    uint8 $s = $body->byte(0);
+    if ($s != IDLE && $s != IN_TRANSACTION && $s != FAILED) {
+        return .error(.malformed("transaction status {$s}"));
+    }
+    return .ok($s);
+}
+
+/**
+ * NegotiateProtocolVersion: the newest minor version the server speaks, and the protocol options
+ * it did not recognise.
+ */
+internal struct Negotiated
+{
+    internal uint32 $minor;
+    internal array<string> $unknown;
+}
+
+internal function negotiated(string::view $body) : result<Negotiated, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    uint32 $minor = guard $c->u32() else ($e) {
+        return .error($e);
+    }
+    uint32 $n = guard $c->u32() else ($e) {
+        return .error($e);
+    }
+    if (($n as usize) > $c->left()) {
+        return .error(.malformed("{$n} unknown options in {$c->left()} bytes"));
+    }
+    array<string> $unknown = array<string>();
+    uint32 $i = 0;
+    while ($i < $n) {
+        string $o = guard $c->cstring() else ($e) {
+            return .error($e);
+        }
+        $unknown->push($o);
+        $i = $i + 1;
+    }
+    return .ok(Negotiated($minor, $unknown));
+}
+
+/**
+ * ErrorResponse or NoticeResponse: one-byte field codes, each followed by its text, and a zero.
+ * Fields this library has no place for are skipped, and so is a field without its NUL: a server's
+ * error is still worth reporting when its message is a little broken.
+ */
+internal function serverError(string::view $body) : pgsql::ServerError
+{
+    string $severity = '';
+    string $state = '';
+    string $message = '';
+    string $detail = '';
+    string $hint = '';
+    uint32 $position = 0;
+    string $where = '';
+    string $schema = '';
+    string $table = '';
+    string $column = '';
+    string $dataType = '';
+    string $constraint = '';
+    string $routine = '';
+    string $localized = '';
+    Cursor $c = Cursor($body);
+    while (!$c->done()) {
+        uint8 $field = $c->u8()->or(0);
+        if ($field == 0) {
+            break;
+        }
+        result<string, pgsql::Error> $text = $c->cstring();
+        if ($text->failed()) {
+            break;
+        }
+        string $v = $text->unwrap();
+        if ($field == 86) {          // V: severity, never translated
+            $severity = $v;
+        } else if ($field == 83) {   // S: severity, maybe translated
+            $localized = $v;
+        } else if ($field == 67) {   // C
+            $state = $v;
+        } else if ($field == 77) {   // M
+            $message = $v;
+        } else if ($field == 68) {   // D
+            $detail = $v;
+        } else if ($field == 72) {   // H
+            $hint = $v;
+        } else if ($field == 80) {   // P
+            $position = (str::uint($v) ?? 0) as uint32;
+        } else if ($field == 87) {   // W
+            $where = $v;
+        } else if ($field == 115) {  // s
+            $schema = $v;
+        } else if ($field == 116) {  // t
+            $table = $v;
+        } else if ($field == 99) {   // c
+            $column = $v;
+        } else if ($field == 100) {  // d
+            $dataType = $v;
+        } else if ($field == 110) {  // n
+            $constraint = $v;
+        } else if ($field == 82) {   // R
+            $routine = $v;
+        }
+    }
+    if ($severity->empty()) {
+        $severity = $localized;
+    }
+    if ($state->size() != 5) {
+        $state = 'XX000';
+    }
+    return pgsql::ServerError(pgsql::ErrorCode::from(pgsql::sqlstate($state)), $severity, $state, $message, $detail, $hint, $position, $where, $schema, $table, $column, $dataType, $constraint, $routine);
+}
+
+/**
+ * CommandComplete: the tag, and the row count at its end for the commands that report one
+ * (`INSERT 0 5`, `UPDATE 3`, `SELECT 10`, `COPY 7`).
+ */
+internal function complete(string::view $body) : result<pgsql::Outcome, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    string $tag = guard $c->cstring() else ($e) {
+        return .error($e);
+    }
+    usize $space = $tag->find(' ');
+    string $command = $tag->sub(0, $space);
+    uint64 $rows = 0;
+    if ($space < $tag->size()) {
+        // the count is the last word; INSERT puts an oid before it
+        usize $last = pgsql::lastOf($tag, 32);
+        $rows = str::uint($tag->sub($last + 1, $tag->size() - $last - 1)) ?? 0;
+    }
+    return .ok(pgsql::Outcome($rows, $command));
+}
+
+/**
+ * CopyInResponse or CopyOutResponse: the overall format (0 text, 1 binary) and one per column.
+ */
+internal struct CopyFormat
+{
+    internal int16 $format;
+    internal array<int16> $columns;
+}
+
+internal function copyFormat(string::view $body) : result<CopyFormat, pgsql::Error>
+{
+    Cursor $c = Cursor($body);
+    uint8 $format = guard $c->u8() else ($e) {
+        return .error($e);
+    }
+    uint16 $n = guard $c->u16() else ($e) {
+        return .error($e);
+    }
+    if (($n as usize) * 2 > $c->left()) {
+        return .error(.malformed("{$n} column formats in {$c->left()} bytes"));
+    }
+    array<int16> $cols = arr::room<int16>($n as usize);
+    uint16 $i = 0;
+    while ($i < $n) {
+        int16 $f = guard $c->i16() else ($e) {
+            return .error($e);
+        }
+        $cols->push($f);
+        $i = $i + 1;
+    }
+    return .ok(CopyFormat($format as int16, $cols));
+}

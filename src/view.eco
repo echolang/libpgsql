@@ -1,0 +1,277 @@
+namespace pgsql;
+
+#[docs::groups: ["Reads", "Views"]]
+
+/**
+ * The row a stream stands on, read in place. One pass finds where each value starts; each read
+ * decodes just that column. A column nobody asks for costs nothing past that pass. Typed reads
+ * follow `Value`: null for a NULL and for the wrong type, `isNull` tells those apart. `value` is
+ * the read that reports a malformed value. A position past the last column stops the program,
+ * release build included: that is a bug in the code.
+ *
+ * ```echo
+ * usize $id = $rs->columns()->find('id') ?? 0;
+ * while (guard $rs->step()) {
+ *     int64 $n = $rs->view()->int($id) ?? 0;
+ * }
+ * ```
+ */
+public struct RowView
+{
+    internal Columns $columns;
+    // the row, where the connection read it: valid until the stream moves
+    internal string::view $packet;
+    // where each value starts in the row, `NULL_AT` for a NULL, and its size
+    internal array<uint32> $starts;
+    internal array<uint32> $sizes;
+    // true while the view stands on a row
+    internal bool $on;
+
+    internal constructor(Columns $columns)
+    {
+        $this->columns = $columns;
+        $this->packet = string::view(null, 0);
+        $this->starts = array<uint32>();
+        $this->sizes = array<uint32>();
+        $this->on = false;
+    }
+
+    #[docs::group: "Views"]
+    public const function columns() : Columns
+    {
+        return $this->columns;
+    }
+
+    #[docs::group: "Views"]
+
+    /**
+     * How many values this row has. Zero before the first step.
+     */
+    public const function count() : usize
+    {
+        if (!$this->on) {
+            return 0;
+        }
+        return $this->starts->count();
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * True when the value at `$at` is SQL NULL.
+     */
+    public const function isNull(usize $at) : bool
+    {
+        $this->check($at);
+        return $this->starts[$at] == pgsql::protocol::NULL_AT;
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * The value at `$at`, decoded as its column says, NULL included.
+     */
+    public const function value(usize $at) : result<Value, Error>
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return .ok(Value::none);
+        }
+        return $c->value();
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * A SMALLINT, INTEGER, BIGINT or OID.
+     */
+    public const function int(usize $at) : int64?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->int();
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * A float, or any number: an integer, or a numeric parsed (and rounded) to a float.
+     */
+    public const function float(usize $at) : float64?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->float();
+    }
+
+    #[docs::group: "Reads"]
+    public const function bool(usize $at) : bool?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->bool();
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * Text, a numeric as written, JSON, or any type read as text. Copied out of the row.
+     */
+    public const function text(usize $at) : string?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        string::view $v = guard $c->text() else {
+            return null;
+        }
+        string? $out = string::from($v);
+        return $out;
+    }
+
+    #[docs::group: "Views"]
+
+    /**
+     * What `text` reads, in place: no copy, valid until the next `step()`. `text()` is the copy
+     * that outlives the row.
+     */
+    public const function view(usize $at) : string::view?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->text();
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * A BYTEA's bytes, or text as its bytes.
+     */
+    public const function bytes(usize $at) : string?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->bytes();
+    }
+
+    #[docs::group: "Reads"]
+    public const function date(usize $at) : Date?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->date();
+    }
+
+    #[docs::group: "Reads"]
+    public const function time(usize $at) : Time?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->time();
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * A TIMESTAMP or a TIMESTAMPTZ (in UTC), or a DATE at midnight.
+     */
+    public const function datetime(usize $at) : DateTime?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->datetime();
+    }
+
+    #[docs::group: "Reads"]
+    public const function interval(usize $at) : Interval?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->interval();
+    }
+
+    #[docs::group: "Reads"]
+    public const function uuid(usize $at) : Uuid?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->uuid();
+    }
+
+    #[docs::group: "Reads"]
+
+    /**
+     * An array's elements.
+     */
+    public const function list(usize $at) : array<Value>?
+    {
+        pgsql::protocol::Cell $c = guard $this->cell($at) else {
+            return null;
+        }
+        return $c->list();
+    }
+
+    #[docs::group: "Views"]
+
+    /**
+     * The whole row, a copy that outlives the stream: the same `Row` `Rows::next()` hands out.
+     * With no row to stand on it stops the program, release build included.
+     */
+    public const function row() : result<Row, Error>
+    {
+        if (!$this->on) {
+            die('pgsql::RowView stands on no row: row() reads the one the last step() moved to');
+        }
+        return Row::read($this->packet, $this->columns);
+    }
+
+    /**
+     * Stand on `$packet`, a row of the current result.
+     */
+    internal function load(string::view $packet) : status<Error>
+    {
+        $this->packet = $packet;
+        status<Error> $laid = pgsql::protocol::layout($this->packet, $this->columns, $this->starts, $this->sizes);
+        $this->on = !$laid->failed();
+        return $laid;
+    }
+
+    /**
+     * Stand on no row: the bytes of the last one are the connection's again.
+     */
+    internal function leave() : void
+    {
+        $this->packet = string::view(null, 0);
+        $this->on = false;
+    }
+
+    /**
+     * How to read the value at `$at`, or null for a NULL.
+     */
+    private const function cell(usize $at) : pgsql::protocol::Cell?
+    {
+        $this->check($at);
+        uint32 $start = $this->starts[$at];
+        if ($start == pgsql::protocol::NULL_AT) {
+            return null;
+        }
+        pgsql::protocol::Cell? $c = pgsql::protocol::Cell($this->packet->sub($start as usize, $this->sizes[$at] as usize), $this->columns->shapes[$at], $this->columns->binary[$at], $this->columns->list[$at]->type->value());
+        return $c;
+    }
+
+    private const function check(usize $at) : void
+    {
+        if ($at >= $this->count()) {
+            die("pgsql::RowView has {$this->count()} columns, not {$at + 1}");
+        }
+    }
+}

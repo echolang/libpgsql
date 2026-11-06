@@ -1,0 +1,504 @@
+/**
+ * Against a real server: `scripts/test-live.sh` starts one in Docker and sets PGSQL_TEST_URL
+ * (the `app` role, SCRAM) and PGSQL_ROOT_URL (the superuser).
+ */
+
+#[if: pgsql]
+
+use std::time;
+
+internal function liveUrl() : string
+{
+    string::view $url = guard std::env::var('PGSQL_TEST_URL') else {
+        die('PGSQL_TEST_URL is not set: run scripts/test-live.sh');
+    }
+    return string($url);
+}
+
+internal function liveOptions() : pgsql::Options
+{
+    return pgsql::Options::parse(liveUrl())->unwrap();
+}
+
+internal function live() : pgsql::Connection
+{
+    pgsql::Connection $db = guard pgsql::Connection::open(liveUrl()) else ($e) {
+        die("connect: {$e}");
+    }
+    return $db;
+}
+
+internal function root() : pgsql::Connection
+{
+    string::view $url = guard std::env::var('PGSQL_ROOT_URL') else {
+        die('PGSQL_ROOT_URL is not set: run scripts/test-live.sh');
+    }
+    pgsql::Connection $db = guard pgsql::Connection::open(string($url)) else ($e) {
+        die("connect as root: {$e}");
+    }
+    return $db;
+}
+
+#[group: 'live']
+test live_logs_in_with_every_method
+{
+    pgsql::Connection $db = live();
+    assert($db->server->starts('1'));
+    assert($db->key->pid > 0);
+    assert(($db->setting('client_encoding') ?? '') == 'UTF8');
+    $db->close();
+
+    array<string> $users = ['app_md5', 'app_clear', 'trusty'];
+    foreach ($users as $u) {
+        pgsql::Options $o = liveOptions();
+        $o->user = $u;
+        $o->allowCleartext = true;
+        pgsql::Connection $c = guard pgsql::Connection::open($o) else ($e) {
+            die("{$u}: {$e}");
+        }
+        guard $c->ping() else ($e) {
+            die("{$u} ping: {$e}");
+        }
+        $c->close();
+    }
+
+    pgsql::Options $bad = liveOptions();
+    $bad->password = 'wrong';
+    pgsql::Error $e = pgsql::Connection::open($bad)->failure();
+    assert($e->is(.invalidPassword));
+
+    pgsql::Options $clear = liveOptions();
+    $clear->user = 'app_clear';
+    assert(pgsql::Connection::open($clear)->failure()->name() == 'auth');
+}
+
+#[group: 'live']
+test live_simple_queries
+{
+    pgsql::Connection $db = live();
+    pgsql::ResultSet $rs = got($db->query("SELECT 1 AS one, 'two' AS two, NULL::int AS three"));
+    assert($rs->count() == 1);
+    assert(($rs[0]['one']->int() ?? 0) == 1);
+    assert(($rs[0]['two']->text() ?? '') == 'two');
+    assert($rs[0]['three']->isNull());
+    assert($rs->outcome->command == 'SELECT');
+    assert($rs->outcome->affectedRows == 1);
+
+    guard $db->exec('DROP TABLE IF EXISTS items; CREATE TABLE items (id serial PRIMARY KEY, name text NOT NULL, price numeric(10,2), tags text[])') else ($e) {
+        die("create: {$e}");
+    }
+    // an array literal inside the map literal, next to the string literal call above, trips echoc 0.12.5
+    array<string> $lampTags = ['light', 'desk'];
+    pgsql::Outcome $o = did($db->exec('INSERT INTO items (name, price, tags) VALUES (:name, :price, :tags)', ['name' => 'Lamp', 'price' => .numeric('49.90'), 'tags' => $lampTags]));
+    assert($o->affectedRows == 1);
+    assert($o->command == 'INSERT');
+    did($db->exec('INSERT INTO items (name, price) VALUES ($1, $2)', ['Desk', 120]));
+    array<int64> $ids = [1, 2];
+    pgsql::ResultSet $all = got($db->query('SELECT id, name, price, tags FROM items WHERE id = ANY(:ids) ORDER BY id', ['ids' => $ids]));
+    assert($all->count() == 2);
+    assert(($all[0]['price']->numeric() ?? '') == '49.90');
+    assert(($all[1]['price']->numeric() ?? '') == '120.00');
+    array<pgsql::Value> $tags = $all[0]['tags']->list() ?? array<pgsql::Value>();
+    assert($tags->count() == 2);
+    assert(($tags[1]->text() ?? '') == 'desk');
+    assert($all[1]['tags']->isNull());
+
+    pgsql::Error $dup = failsExec($db->exec('INSERT INTO items (id, name) VALUES (1, :n)', ['n' => 'again']));
+    assert($dup->is(.uniqueViolation));
+    assert(($dup->server()?->constraint ?? '') == 'items_pkey');
+    // the connection is ready after an error
+    guard $db->ping() else ($e) {
+        die("ping after error: {$e}");
+    }
+    did($db->exec('DROP TABLE items'));
+    $db->close();
+}
+
+
+/**
+ * Three ways rows come back: binary through the statement cache, text through the unnamed
+ * statement, text through the simple protocol (`batch`).
+ */
+internal function modes() : array<pgsql::Connection>
+{
+    array<pgsql::Connection> $out = array<pgsql::Connection>();
+    $out->push(live());
+    pgsql::Options $o = liveOptions();
+    $o->statementCache = 0;
+    pgsql::Connection $unnamed = guard pgsql::Connection::open($o) else ($e) {
+        die("{$e}");
+    }
+    $out->push($unnamed);
+    return $out;
+}
+
+/**
+ * `$sql` selecting one row, read through the cache, the unnamed statement and `batch`; every
+ * column of the three must agree, and the cached one is handed back.
+ */
+internal function everyWay(const string& $sql) : pgsql::Row
+{
+    array<pgsql::Row> $rows = array<pgsql::Row>();
+    foreach (modes() as $db) {
+        pgsql::ResultSet $rs = guard $db->query($sql) else ($e) {
+            die("{$sql}: {$e}");
+        }
+        $rows->push($rs[0]);
+    }
+    pgsql::Connection $simple = live();
+    array<pgsql::ResultSet> $sets = guard $simple->batch($sql) else ($e) {
+        die("{$sql}: {$e}");
+    }
+    $rows->push($sets[0][0]);
+    pgsql::Row $first = $rows[0];
+    usize $i = 0;
+    while ($i < $first->count()) {
+        string $want = "{$first[$i]}";
+        foreach ($rows as const &$r) {
+            string $got = "{$r[$i]}";
+            if ($got != $want) {
+                die("{$sql}: column {$i} reads '{$got}' one way and '{$want}' another");
+            }
+        }
+        $i = $i + 1;
+    }
+    return $first;
+}
+
+#[group: 'live']
+test live_every_type_reads_the_same_every_way
+{
+    pgsql::Row $r = everyWay("SELECT true AS b, 32767::int2 AS i2, (-2147483648)::int4 AS i4, 9223372036854775807::int8 AS i8, 1.5::float4 AS f4, 0.1::float8 AS f8, 'NaN'::float8 AS nan, '-Infinity'::float8 AS ninf, 123.4500::numeric AS n, 'héllo'::text AS t, 'x'::varchar(3) AS v, 'ab'::char(4) AS c, '\\x00ff'::bytea AS by, '{\"a\": [1, 2]}'::json AS j, '{\"a\": 1}'::jsonb AS jb, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid AS u, '2024-02-29'::date AS d, '0044-03-15 BC'::date AS bc, 'infinity'::date AS dinf, '13:04:05.123456'::time AS tm, '2024-02-29 13:04:05.5'::timestamp AS ts, '2024-02-29 13:04:05.5+02'::timestamptz AS tz, '-infinity'::timestamptz AS tzinf, '1 year 2 mons 3 days 04:05:06.5'::interval AS iv, '-1 days +02:03:00'::interval AS iv2, 26::oid AS o, ARRAY[1, NULL, 3]::int4[] AS ai, ARRAY[['a', 'b'], ['c', 'd\"e']]::text[] AS at, '{}'::int8[] AS ae, ARRAY[1.5, 2.25]::numeric[] AS an, 'happy'::name AS nm, '10.0.0.1'::inet AS other, NULL::int4 AS nul");
+    assert(($r['b']->bool() ?? false));
+    assert(($r['i2']->int() ?? 0) == 32767);
+    assert(($r['i4']->int() ?? 0) == -2147483648);
+    assert(($r['i8']->int() ?? 0) == 9223372036854775807);
+    assert(($r['f4']->float() ?? 0.0) == 1.5);
+    assert(($r['f8']->float() ?? 0.0) == 0.1);
+    assert("{$r['nan']}" == 'NaN');
+    assert("{$r['ninf']}" == '-Infinity');
+    assert(($r['n']->numeric() ?? '') == '123.4500');
+    assert(($r['t']->text() ?? '') == 'héllo');
+    assert(($r['c']->text() ?? '') == 'ab  ');
+    assert(($r['by']->bytes() ?? '')->size() == 2);
+    assert(($r['j']->json() ?? '') == '{"a": [1, 2]}');
+    assert(($r['jb']->json() ?? '') == '{"a": 1}');
+    assert("{$r['u']}" == 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    assert("{$r['d']}" == '2024-02-29');
+    assert(($r['bc']->date() ?? pgsql::Date())->year == -43);
+    assert(($r['dinf']->date() ?? pgsql::Date())->infinite());
+    assert("{$r['tm']}" == '13:04:05.123456');
+    assert("{$r['ts']}" == '2024-02-29 13:04:05.5');
+    assert("{$r['tz']}" == '2024-02-29 11:04:05.5+00');
+    assert("{$r['tzinf']}" == '-infinity');
+    assert("{$r['iv']}" == '1 year 2 mons 3 days 04:05:06.5');
+    assert("{$r['iv2']}" == '-1 days +02:03:00');
+    assert(($r['o']->int() ?? 0) == 26);
+    assert("{$r['ai']}" == '{"1",NULL,"3"}');
+    assert("{$r['at']}" == '{{"a","b"},{"c","d\\"e"}}');
+    assert("{$r['ae']}" == '{}');
+    assert("{$r['an']}" == '{"1.5","2.25"}');
+    assert(($r['nm']->text() ?? '') == 'happy');
+    assert(($r['other']->text() ?? '') == '10.0.0.1');
+    assert($r['nul']->isNull());
+}
+
+#[group: 'live']
+test live_every_type_goes_in_as_a_parameter
+{
+    foreach (modes() as $db) {
+        array<int64> $ints = [1, 2, 3];
+        array<string> $texts = ['a', 'b"c', 'NULL'];
+        pgsql::Params $p = pgsql::Params::of([
+            true, 7, 3000000000, 1.25, .numeric('99.99'), 'text', .bytes('raw'), .json('{"k": true}'),
+            pgsql::Uuid::parse('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') ?? pgsql::Uuid(''),
+            pgsql::Date(2024, 2, 29), pgsql::Time(23, 59, 59, 999999), pgsql::DateTime(1999, 12, 31, 23, 59, 59, 1),
+            pgsql::Value::timestamptz(pgsql::DateTime(2000, 1, 1, 0, 0, 0, 0)), pgsql::Interval(14, 3, 1500000),
+            $ints, $texts, pgsql::Value::none, pgsql::Date::past(), .text('42'),
+        ]);
+        string $sql = 'SELECT $1::bool, $2::int2, $3::int8, $4::float8, $5::numeric, $6::text, $7::bytea, $8::jsonb, $9::uuid, $10::date, $11::time, $12::timestamp, $13::timestamptz, $14::interval, $15::int8[], $16::text[], $17::int4, $18::date, $19::int4';
+        pgsql::ResultSet $rs = guard $db->query($sql, $p) else ($e) {
+            die("params: {$e}");
+        }
+        pgsql::Row $r = $rs[0];
+        assert(($r[0]->bool() ?? false));
+        assert(($r[1]->int() ?? 0) == 7);
+        assert(($r[2]->int() ?? 0) == 3000000000);
+        assert(($r[3]->float() ?? 0.0) == 1.25);
+        assert(($r[4]->numeric() ?? '') == '99.99');
+        assert(($r[5]->text() ?? '') == 'text');
+        assert(($r[6]->bytes() ?? '') == 'raw');
+        assert(($r[7]->json() ?? '') == '{"k": true}');
+        assert("{$r[8]}" == 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+        assert("{$r[9]}" == '2024-02-29');
+        assert("{$r[10]}" == '23:59:59.999999');
+        assert("{$r[11]}" == '1999-12-31 23:59:59.000001');
+        assert("{$r[12]}" == '2000-01-01 00:00:00+00');
+        assert("{$r[13]}" == '1 year 2 mons 3 days 00:00:01.5');
+        assert("{$r[14]}" == '{"1","2","3"}');
+        array<pgsql::Value> $listed = $r[15]->list() ?? array<pgsql::Value>();
+        assert(($listed[1]->text() ?? '') == 'b"c');
+        assert(($listed[2]->text() ?? '') == 'NULL');
+        assert($r[16]->isNull());
+        assert("{$r[17]}" == '-infinity');
+        assert(($r[18]->int() ?? 0) == 42);
+    }
+}
+
+#[group: 'live']
+test live_out_of_range_parameters_are_refused_here
+{
+    pgsql::Connection $db = live();
+    pgsql::Error $e = failsQuery($db->query('SELECT $1::int2', [70000]));
+    assert($e->name() == 'invalid');
+    fine($db->ping());
+}
+
+#[group: 'live']
+test live_streams_and_row_views
+{
+    pgsql::Connection $db = live();
+    pgsql::Rows $rows = streamed($db->stream('SELECT g AS id, repeat(\'x\', g % 50) AS pad, g * 1.5 AS f FROM generate_series(1, 20000) g'));
+    // the connection is busy until the stream is done
+    assert(failsStatus($db->ping())->name() == 'busy');
+    int64 $sum = 0;
+    usize $chars = 0;
+    usize $id = $rows->columns()->find('id') ?? 99;
+    while (true) {
+        bool $more = guard $rows->step() else ($e) {
+            die("step: {$e}");
+        }
+        if (!$more) {
+            break;
+        }
+        const pgsql::RowView& $v = $rows->view();
+        $sum = $sum + ($v->int($id) ?? 0);
+        $chars = $chars + ($v->view(1) ?? '')->size;
+    }
+    assert($sum == 200010000);
+    assert($rows->outcome()->affectedRows == 20000);
+    fine($db->ping());
+
+    pgsql::Rows $again = streamed($db->stream('SELECT g FROM generate_series(1, 1000) g WHERE g > :min', ['min' => 990]));
+    int64 $n = 0;
+    foreach ($again as $row) {
+        $n = $n + ($row['g']->int() ?? 0);
+    }
+    fine($again->finish());
+    assert($n == 9955);
+
+    // dropping a stream halfway reads the rest away
+    pgsql::Rows $half = streamed($db->stream('SELECT g FROM generate_series(1, 50000) g'));
+    bool $one = guard $half->step() else ($e) {
+        die("step: {$e}");
+    }
+    assert($one);
+    fine($half->finish());
+    fine($db->ping());
+
+    // an error in the middle of the rows reaches the stream and leaves the connection ready
+    pgsql::Rows $bad = streamed($db->stream('SELECT 10 / (5000 - g) FROM generate_series(1, 10000) g'));
+    while (true) {
+        result<bool, pgsql::Error> $s = $bad->step();
+        if ($s->failed()) {
+            assert($s->failure()->is(.divisionByZero));
+            break;
+        }
+        assert($s->unwrap());
+    }
+    fine($db->ping());
+}
+
+#[group: 'live']
+test live_statements_batch_and_cache
+{
+    pgsql::Connection $db = live();
+    did($db->exec('DROP TABLE IF EXISTS kv; CREATE TABLE kv (k text PRIMARY KEY, v int)'));
+    pgsql::Statement $ins = prepared($db->prepare('INSERT INTO kv VALUES (:k, :v) ON CONFLICT (k) DO UPDATE SET v = excluded.v'));
+    assert($ins->params() == 2);
+    assert($ins->names[0] == 'k');
+    int32 $i = 0;
+    while ($i < 100) {
+        did($ins->exec(['k' => "key{$i}", 'v' => $i]));
+        $i = $i + 1;
+    }
+    $ins->close();
+    pgsql::ResultSet $c = got($db->query('SELECT count(*) AS n, sum(v) AS s FROM kv'));
+    assert(($c[0]['n']->int() ?? 0) == 100);
+    assert(($c[0]['s']->int() ?? 0) == 4950);
+
+    array<pgsql::ResultSet> $sets = gotAll($db->batch('SELECT 1 AS a; UPDATE kv SET v = v + 1; SELECT k FROM kv ORDER BY k LIMIT 2'));
+    assert($sets->count() == 3);
+    assert($sets[1]->outcome->affectedRows == 100);
+    assert($sets[2]->count() == 2);
+    assert(($sets[2][0]['k']->text() ?? '') == 'key0');
+
+    // a schema change under a cached statement: prepared again, run again
+    pgsql::ResultSet $before = got($db->query('SELECT * FROM kv WHERE k = :k', ['k' => 'key1']));
+    assert($before->columns->count() == 2);
+    did($db->exec('ALTER TABLE kv ADD COLUMN extra int DEFAULT 5'));
+    pgsql::ResultSet $after = got($db->query('SELECT * FROM kv WHERE k = :k', ['k' => 'key1']));
+    assert($after->columns->count() == 3);
+    assert(($after[0]['extra']->int() ?? 0) == 5);
+
+    // statements gone from the server: prepared again
+    did($db->exec('DEALLOCATE ALL'));
+    pgsql::ResultSet $redo = got($db->query('SELECT * FROM kv WHERE k = :k', ['k' => 'key2']));
+    assert($redo->count() == 1);
+
+    // a cache of 2 keeps working past 2 statements
+    pgsql::Options $o = liveOptions();
+    $o->statementCache = 2;
+    pgsql::Connection $small = guard pgsql::Connection::open($o) else ($e) {
+        die("{$e}");
+    }
+    int32 $round = 0;
+    while ($round < 3) {
+        int32 $q = 0;
+        while ($q < 5) {
+            pgsql::ResultSet $one = got($small->query("SELECT {$q}::int + :x AS v", ['x' => 1]));
+            assert(($one[0]['v']->int() ?? 0) == ($q + 1) as int64);
+            $q = $q + 1;
+        }
+        $round = $round + 1;
+    }
+    pgsql::ResultSet $open = got($small->query('SELECT count(*) AS n FROM pg_prepared_statements'));
+    assert(($open[0]['n']->int() ?? 99) <= 2);
+    did($db->exec('DROP TABLE kv'));
+}
+
+#[group: 'live']
+test live_transactions
+{
+    pgsql::Connection $db = live();
+    did($db->exec('DROP TABLE IF EXISTS acct; CREATE TABLE acct (id int PRIMARY KEY, n int)'));
+    {
+        pgsql::Transaction $tx = begun($db->begin());
+        assert($db->inTransaction());
+        did($db->exec('INSERT INTO acct VALUES (1, 1)'));
+        // dropped without commit: rolled back
+    }
+    assert(!$db->inTransaction());
+    assert((got($db->query('SELECT count(*) AS n FROM acct'))[0]['n']->int() ?? 9) == 0);
+
+    pgsql::Transaction $ok = begun($db->begin(pgsql::Isolation::serializable));
+    did($db->exec('INSERT INTO acct VALUES (1, 1)'));
+    fine($ok->commit());
+    assert(!$db->inTransaction());
+
+    // a failed transaction refuses everything but ROLLBACK, and COMMIT says so
+    pgsql::Transaction $bad = begun($db->begin());
+    assert(failsExec($db->exec('INSERT INTO acct VALUES (1, 2)'))->is(.uniqueViolation));
+    assert(failsExec($db->exec('SELECT 1'))->is(.inFailedSqlTransaction));
+    assert(failsStatus($bad->commit())->is(.inFailedSqlTransaction));
+    assert(!$db->inTransaction());
+
+    status<pgsql::Error> $t = $db->transaction(function(pgsql::Connection $c) : status<pgsql::Error> {
+        guard $c->exec('UPDATE acct SET n = n + 10') else ($e) {
+            return .error($e);
+        }
+        return .error(.invalid('changed my mind'));
+    });
+    assert($t->failed());
+    assert((got($db->query('SELECT n FROM acct'))[0]['n']->int() ?? 0) == 1);
+
+    result<int64, pgsql::Error> $v = $db->transaction<int64>(function(pgsql::Connection $c) : result<int64, pgsql::Error> {
+        pgsql::ResultSet $rs = guard $c->query('UPDATE acct SET n = n + 1 RETURNING n') else ($e) {
+            return .error($e);
+        }
+        return .ok($rs[0][0]->int() ?? 0);
+    });
+    assert(($v->or(0)) == 2);
+
+    // a COMMIT the busy connection refused leaves the transaction open, and rolled back on drop
+    {
+        pgsql::Transaction $busy = begun($db->begin());
+        did($db->exec('INSERT INTO acct VALUES (50, 50)'));
+        pgsql::Rows $open = streamed($db->stream('SELECT * FROM generate_series(1, 10)'));
+        assert(failsStatus($busy->commit())->name() == 'busy');
+        assert($busy->open());
+        fine($open->finish());
+    }
+    assert(!$db->inTransaction());
+    assert((got($db->query('SELECT count(*) AS n FROM acct WHERE id = 50'))[0]['n']->int() ?? 9) == 0);
+
+    pgsql::Transaction $ro = begun($db->begin(pgsql::Isolation::repeatableRead, true));
+    assert(failsExec($db->exec('DELETE FROM acct'))->is(.readOnlySqlTransaction));
+    fine($ro->rollback());
+    did($db->exec('DROP TABLE acct'));
+}
+
+#[group: 'live']
+test live_timeout_cancels_and_keeps_the_connection
+{
+    pgsql::Connection $db = live();
+    pgsql::Error $e = failsQuery($db->query('SELECT pg_sleep(5)', by: tcp::Deadline(ms: 300)));
+    assert($e->name() == 'timeout');
+    assert($db->alive());
+    pgsql::ResultSet $rs = got($db->query('SELECT 7 AS n'));
+    assert(($rs[0]['n']->int() ?? 0) == 7);
+
+    // a cancel from another connection's side
+    pgsql::Options $o = liveOptions();
+    pgsql::CancelKey $key = $db->key;
+    std::thread::handle $h = guard std::thread::spawn(function() : void {
+        std::thread::sleep(300);
+        status<pgsql::Error> $c = pgsql::cancel($o, $key);
+    }) else ($e2) {
+        die($e2->message());
+    }
+    pgsql::Error $c = failsExec($db->exec('SELECT pg_sleep(5)'));
+    assert($c->is(.queryCanceled));
+    $h->join();
+    fine($db->ping());
+
+    // statement_timeout set at startup
+    pgsql::Options $st = liveOptions();
+    $st->settings['statement_timeout'] = '200';
+    pgsql::Connection $quick = guard pgsql::Connection::open($st) else ($e3) {
+        die("{$e3}");
+    }
+    assert(failsQuery($quick->query('SELECT pg_sleep(2)'))->is(.queryCanceled));
+}
+
+#[group: 'live']
+test live_notices_reach_the_hook
+{
+    pgsql::Connection $db = live();
+    rc<array<string>> $heard = rc<array<string>>(array<string>());
+    $db->onNotice(function(pgsql::ServerError $n) : void {
+        $heard->value->push($n->message);
+    });
+    did($db->exec('DO $$ BEGIN RAISE NOTICE \'hello %\', 42; END $$'));
+    assert($heard->value->count() == 1);
+    assert($heard->value[0] == 'hello 42');
+    did($db->exec('SET TimeZone = \'Asia/Tokyo\''));
+    assert(($db->setting('TimeZone') ?? '') == 'Asia/Tokyo');
+    // binary timestamptz does not care about the session zone
+    pgsql::ResultSet $rs = got($db->query('SELECT \'2024-01-01 00:00:00+00\'::timestamptz AS t'));
+    assert("{$rs[0]['t']}" == '2024-01-01 00:00:00+00');
+}
+
+#[group: 'live']
+test live_protocol_3_2_and_its_long_cancel_key
+{
+    pgsql::Options $o = liveOptions();
+    $o->protocol = pgsql::Protocol::v3_2;
+    pgsql::Connection $db = guard pgsql::Connection::open($o) else ($e) {
+        die("{$e}");
+    }
+    int64 $major = str::int(str::split($db->server, '.')->owned()[0]) ?? 0;
+    if ($major >= 18) {
+        assert($db->protocol == pgsql::protocol::PROTOCOL_3_2);
+        assert($db->key->secret->size() > 4);
+    } else {
+        // an older server negotiates down
+        assert($db->protocol == pgsql::protocol::PROTOCOL_3_0);
+        assert($db->key->secret->size() == 4);
+    }
+    // the key cancels, whatever its length
+    assert(failsQuery($db->query('SELECT pg_sleep(5)', by: tcp::Deadline(ms: 300)))->name() == 'timeout');
+    fine($db->ping());
+}
+
+#[end]

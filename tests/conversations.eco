@@ -1,0 +1,635 @@
+/**
+ * Whole conversations against the scripted server: the statement cache, results and errors in
+ * every position, cancel on a timeout, COPY both ways, pipelines, the unnamed statement.
+ */
+
+use pgsql::protocol::{PARSE, BIND, DESCRIBE, EXECUTE, SYNC, CLOSE, QUERY, TERMINATE, NOTICE, PARAMETER_STATUS, DATA_ROW, COMMAND_COMPLETE, BIND_COMPLETE, CLOSE_COMPLETE, PARSE_COMPLETE, ROW_DESCRIPTION, EMPTY_QUERY, COPY_IN, COPY_OUT, COPY_DATA, COPY_DONE, COPY_FAIL, PORTAL_SUSPENDED, OID_INT4, OID_TEXT, OID_INT8};
+use std::time;
+
+/**
+ * What a Bind carried.
+ */
+internal struct Bound
+{
+    internal string $statement;
+    internal array<int16> $paramFormats;
+    internal array<string> $values;
+    internal array<int16> $resultFormats;
+}
+
+internal function bound(const string& $body) : Bound
+{
+    pgsql::protocol::Cursor $c = pgsql::protocol::Cursor($body);
+    $c->cstring();
+    string $statement = $c->cstring()->or('?');
+    array<int16> $pf = array<int16>();
+    int16 $n = $c->i16()->or(0);
+    while ($n > 0) {
+        $pf->push($c->i16()->or(0));
+        $n = $n - 1;
+    }
+    array<string> $values = array<string>();
+    int16 $count = $c->i16()->or(0);
+    while ($count > 0) {
+        int32 $len = $c->i32()->or(0);
+        if ($len < 0) {
+            $values->push('<NULL>');
+        } else {
+            $values->push($c->bytes($len as usize)->or(''));
+        }
+        $count = $count - 1;
+    }
+    array<int16> $rf = array<int16>();
+    int16 $r = $c->i16()->or(0);
+    while ($r > 0) {
+        $rf->push($c->i16()->or(0));
+        $r = $r - 1;
+    }
+    return Bound($statement, $pf, $values, $rf);
+}
+
+/**
+ * The statement name a Parse names.
+ */
+internal function parsed(const Msg& $m) : string
+{
+    pgsql::protocol::Cursor $c = pgsql::protocol::Cursor($m->body);
+    return $c->cstring()->or('?');
+}
+
+test a_cached_query_is_prepared_once_and_bound_after
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        array<Msg> $first = $w->batch();
+        assert($first->count() == 3);
+        assert($first[0]->type == PARSE && $first[1]->type == DESCRIBE);
+        string $name = parsed($first[0]);
+        assert($first[0]->body->contains('WHERE id = $1'));
+        array<uint32> $types = [OID_INT4];
+        array<string> $specs = ['id:23', 'name:25'];
+        $w->describe($types, columns($specs));
+        $w->ready();
+        int32 $round = 0;
+        while ($round < 2) {
+            array<Msg> $run = $w->batch();
+            assert($run->count() == 3);
+            assert($run[0]->type == BIND && $run[1]->type == EXECUTE);
+            Bound $b = bound($run[0]->body);
+            assert($b->statement == $name);
+            // an int for an int4 parameter goes in binary; both columns come back in binary
+            assert($b->paramFormats->count() == 1 && $b->paramFormats[0] == 1);
+            assert($b->values[0] == be32(7));
+            assert($b->resultFormats->count() == 1 && $b->resultFormats[0] == 1);
+            $w->send(BIND_COMPLETE, '');
+            array<string> $row = [be32(7), 'Lamp'];
+            $w->send(DATA_ROW, dataRow($row));
+            $w->send(COMMAND_COMPLETE, commandComplete('SELECT 1'));
+            $w->ready();
+            $round = $round + 1;
+        }
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    int32 $i = 0;
+    while ($i < 2) {
+        pgsql::ResultSet $rs = got($db->query('SELECT id, name FROM t WHERE id = :id', ['id' => 7]));
+        assert($rs->count() == 1);
+        assert(($rs[0]['id']->int() ?? 0) == 7);
+        assert(($rs[0]['name']->text() ?? '') == 'Lamp');
+        assert($rs->columns->at(0)->binary());
+        assert($rs->outcome->affectedRows == 1);
+        $i = $i + 1;
+    }
+    $db->close();
+    $f->server->join();
+}
+
+test a_full_cache_closes_the_statement_used_longest_ago
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        array<string> $names = array<string>();
+        int32 $q = 0;
+        while ($q < 3) {
+            array<Msg> $prep = $w->batch();
+            assert($prep[0]->type == PARSE);
+            $names->push(parsed($prep[0]));
+            array<uint32> $none = array<uint32>();
+            $w->describe($none, '');
+            $w->ready();
+            array<Msg> $run = $w->batch();
+            if ($q == 2) {
+                // the third statement pushed the first out: closed ahead of the next command
+                assert($run[0]->type == CLOSE);
+                assert($run[0]->body->contains($names[0]));
+                $w->send(CLOSE_COMPLETE, '');
+                $run->remove(0);
+            }
+            assert($run->count() == 3 && $run[0]->type == BIND);
+            $w->send(BIND_COMPLETE, '');
+            $w->send(COMMAND_COMPLETE, commandComplete('UPDATE 0'));
+            $w->ready();
+            $q = $q + 1;
+        }
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->statementCache = 2;
+    pgsql::Connection $db = login($o);
+    did($db->exec('UPDATE a SET x = 1', pgsql::Params()));
+    did($db->exec('UPDATE b SET x = 1', pgsql::Params()));
+    did($db->exec('UPDATE c SET x = 1', pgsql::Params()));
+    $db->close();
+    $f->server->join();
+}
+
+test a_stale_statement_is_prepared_again_and_run_once_more
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['a:23'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        assert($w->kinds() == 'BES');
+        $w->error('0A000', 'cached plan must not change result type');
+        $w->ready();
+        // the old statement is closed, the SQL prepared again
+        array<Msg> $again = $w->batch();
+        assert($again[0]->type == CLOSE && $again[1]->type == PARSE);
+        $w->send(CLOSE_COMPLETE, '');
+        array<string> $two = ['a:23', 'b:23'];
+        $w->describe($none, columns($two));
+        $w->ready();
+        assert($w->kinds() == 'BES');
+        $w->send(BIND_COMPLETE, '');
+        array<string> $row = [be32(1), be32(2)];
+        $w->send(DATA_ROW, dataRow($row));
+        $w->send(COMMAND_COMPLETE, commandComplete('SELECT 1'));
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::ResultSet $rs = got($db->query('SELECT * FROM t'));
+    assert($rs->columns->count() == 2);
+    assert(($rs[0]['b']->int() ?? 0) == 2);
+    $db->close();
+    $f->server->join();
+}
+
+test a_stale_statement_inside_a_transaction_is_reported
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['a:23'];
+        $w->describe($none, columns($one));
+        $w->ready(84);
+        $w->batch();
+        $w->error('0A000', 'cached plan must not change result type');
+        $w->ready(69);
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Error $e = failsQuery($db->query('SELECT * FROM t'));
+    assert($e->is(.featureNotSupported));
+    assert($db->inTransaction());
+    $db->close();
+    $f->server->join();
+}
+
+test errors_notices_and_settings_in_the_middle_of_rows
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['n:25'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        $w->batch();
+        $w->send(BIND_COMPLETE, '');
+        array<string> $a = ['a'];
+        $w->send(DATA_ROW, dataRow($a));
+        $w->send(NOTICE, errorFields('NOTICE', '00000', 'halfway'));
+        $w->send(PARAMETER_STATUS, setting('TimeZone', 'Europe/Zurich'));
+        $w->send(65, 'a notification nobody listens to');
+        array<string> $b = ['b'];
+        $w->send(DATA_ROW, dataRow($b));
+        $w->error('22012', 'division by zero');
+        $w->ready();
+        // the connection answers the next command
+        $w->expect(SYNC);
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    rc<array<string>> $heard = rc<array<string>>(array<string>());
+    $db->onNotice(function(pgsql::ServerError $n) : void {
+        $heard->value->push($n->message);
+    });
+    pgsql::Rows $rows = streamed($db->stream('SELECT n FROM t'));
+    array<string> $seen = array<string>();
+    foreach ($rows as $row) {
+        $seen->push($row['n']->text() ?? '');
+    }
+    assert($rows->finish()->failure()->is(.divisionByZero));
+    assert($seen->count() == 2);
+    assert($heard->value[0] == 'halfway');
+    assert(($db->setting('TimeZone') ?? '') == 'Europe/Zurich');
+    fine($db->ping());
+    $db->close();
+    $f->server->join();
+}
+
+test a_stream_keeps_the_connection_busy_until_its_end
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['n:23'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        $w->batch();
+        $w->send(BIND_COMPLETE, '');
+        int32 $i = 0;
+        while ($i < 1000) {
+            array<string> $r = [be32($i as uint32)];
+            $w->send(DATA_ROW, dataRow($r));
+            $i = $i + 1;
+        }
+        $w->send(COMMAND_COMPLETE, commandComplete('SELECT 1000'));
+        $w->ready(84);
+        $w->expect(SYNC);
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Rows $rows = streamed($db->stream('SELECT n FROM t'));
+    bool $one = guard $rows->step() else ($e) {
+        die("{$e}");
+    }
+    assert($one);
+    assert(($rows->view()->int(0) ?? 9) == 0);
+    assert(failsStatus($db->ping())->name() == 'busy');
+    assert(failsQuery($db->query('SELECT 1'))->name() == 'busy');
+    // finishing reads the rest away
+    fine($rows->finish());
+    assert($rows->outcome()->affectedRows == 1000);
+    // the status the stream's ReadyForQuery reported
+    assert($rows->outcome()->inTransaction());
+    fine($db->ping());
+    $db->close();
+    $f->server->join();
+}
+
+test a_timeout_cancels_and_the_connection_stays
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['n:23'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        $w->batch();
+        // nothing until the cancel request comes, then what a cancelled statement answers
+        string $key = $w->cancelled();
+        assert(tcp::wire::be32($key, 0) == 4242);
+        assert($key->sub(4, 4) == 'k3y!');
+        $w->error('57014', 'canceling statement due to user request');
+        $w->ready();
+        $w->expect(SYNC);
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Error $e = failsQuery($db->query('SELECT pg_sleep(10)', by: tcp::Deadline(ms: 200)));
+    assert($e->name() == 'timeout');
+    assert($db->alive());
+    fine($db->ping());
+    $db->close();
+    $f->server->join();
+}
+
+test a_cancel_that_never_lands_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(SYNC);
+        $w->cancelled();
+        // the server says nothing more
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->cancelWait = time::duration::millis(200);
+    pgsql::Connection $db = login($o);
+    assert(failsStatus($db->ping(by: tcp::Deadline(ms: 100)))->name() == 'timeout');
+    assert(!$db->alive());
+    $f->server->join();
+}
+
+test simple_exec_and_batch_read_every_result
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        assert($w->expect(QUERY) == "BEGIN; UPDATE t SET a = 1; SELECT 1\0");
+        $w->send(COMMAND_COMPLETE, commandComplete('BEGIN'));
+        $w->send(COMMAND_COMPLETE, commandComplete('UPDATE 3'));
+        array<string> $spec = ['?column?:23'];
+        array<array<string>> $rows = [['1']];
+        $w->rows(columns($spec), $rows);
+        $w->ready(84);
+        $w->expect(QUERY);
+        $w->send(EMPTY_QUERY, '');
+        $w->ready(84);
+        $w->expect(QUERY);
+        array<string> $two = ['a:25', 'b:23'];
+        array<array<string>> $some = [['x', '<NULL>'], ['y', '2']];
+        $w->rows(columns($two), $some);
+        $w->send(COMMAND_COMPLETE, commandComplete('DELETE 2'));
+        $w->ready(84);
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Outcome $o = did($db->exec('BEGIN; UPDATE t SET a = 1; SELECT 1'));
+    // the last statement's outcome
+    assert($o->command == 'SELECT');
+    assert($o->inTransaction());
+    assert($db->inTransaction());
+    pgsql::Outcome $empty = did($db->exec(''));
+    assert($empty->command == '');
+    array<pgsql::ResultSet> $sets = gotAll($db->batch('SELECT a, b FROM t; DELETE FROM t'));
+    assert($sets->count() == 2);
+    assert(($sets[0][0]['a']->text() ?? '') == 'x');
+    assert($sets[0][0]['b']->isNull());
+    // the simple protocol's rows are text, decoded all the same
+    assert(($sets[0][1]['b']->int() ?? 0) == 2);
+    assert($sets[1]->outcome->affectedRows == 2);
+    // every result of the script carries the status the script ended with
+    assert($sets[0]->outcome->inTransaction());
+    assert($sets[1]->outcome->inTransaction());
+    $db->close();
+    $f->server->join();
+}
+
+test the_unnamed_statement_runs_in_one_round_trip
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        array<Msg> $all = $w->batch();
+        assert($all->count() == 5);
+        assert($all[0]->type == PARSE && $all[1]->type == BIND && $all[2]->type == DESCRIBE && $all[3]->type == EXECUTE);
+        Bound $b = bound($all[1]->body);
+        // no types asked, so values go as text, and rows come as text
+        assert($b->paramFormats->empty());
+        assert($b->values[0] == '41' && $b->values[1] == '<NULL>');
+        assert($b->resultFormats->empty());
+        $w->send(PARSE_COMPLETE, '');
+        $w->send(BIND_COMPLETE, '');
+        array<string> $spec = ['n:23'];
+        array<array<string>> $rows = [['42']];
+        $w->rows(columns($spec), $rows);
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Options $o = optionsFor($f);
+    $o->statementCache = 0;
+    pgsql::Connection $db = login($o);
+    int64? $nothing = null;
+    pgsql::ResultSet $rs = got($db->query('SELECT :n + 1 AS n, :m', ['n' => 41, 'm' => $nothing]));
+    assert(($rs[0]['n']->int() ?? 0) == 42);
+    $db->close();
+    $f->server->join();
+}
+
+test copy_in_out_and_abandoned
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(QUERY);
+        string $fmt = '';
+        $fmt->push(0);
+        tcp::wire::putBe16($fmt, 2);
+        tcp::wire::putBe16($fmt, 0);
+        tcp::wire::putBe16($fmt, 0);
+        $w->send(COPY_IN, $fmt);
+        string $data = '';
+        while (true) {
+            Msg $m = $w->recv();
+            if ($m->type == COPY_DONE) {
+                break;
+            }
+            assert($m->type == COPY_DATA);
+            $data->append($m->body);
+        }
+        assert($data == "1\ta\\tb\n2\t\\N\nraw\n");
+        $w->send(COMMAND_COMPLETE, commandComplete('COPY 3'));
+        $w->ready();
+
+        $w->expect(QUERY);
+        $w->send(COPY_IN, $fmt);
+        $w->expect(COPY_DATA);
+        assert($w->expect(COPY_FAIL) == "never mind\0");
+        $w->error('57014', 'COPY from stdin failed: never mind');
+        $w->ready();
+
+        $w->expect(QUERY);
+        $w->send(COPY_OUT, $fmt);
+        $w->send(COPY_DATA, "1\tx\n");
+        $w->send(COPY_DATA, "2\ty\n");
+        $w->send(COPY_DONE, '');
+        $w->send(COMMAND_COMPLETE, commandComplete('COPY 2'));
+        $w->ready();
+
+        // a COPY sent as a query is failed by the client
+        $w->expect(QUERY);
+        $w->send(COPY_IN, $fmt);
+        $w->expect(COPY_FAIL);
+        $w->error('57014', 'COPY from stdin failed');
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::CopyIn $in = guard $db->copyIn('COPY t FROM STDIN') else ($e) {
+        die("{$e}");
+    }
+    array<pgsql::Value> $r1 = [1, "a\tb"];
+    array<pgsql::Value> $r2 = [2, pgsql::Value::none];
+    fine($in->row($r1));
+    fine($in->row($r2));
+    fine($in->write("raw\n"));
+    pgsql::Outcome $o = guard $in->finish() else ($e) {
+        die("{$e}");
+    }
+    assert($o->affectedRows == 3);
+    assert($in->finish()->failed());
+
+    pgsql::CopyIn $gone = guard $db->copyIn('COPY t FROM STDIN') else ($e) {
+        die("{$e}");
+    }
+    fine($gone->write("x\n"));
+    fine($gone->abort('never mind'));
+
+    pgsql::CopyOut $out = guard $db->copyOut('COPY t TO STDOUT') else ($e) {
+        die("{$e}");
+    }
+    string $all = '';
+    while (true) {
+        string::view? $chunk = guard $out->next() else ($e) {
+            die("{$e}");
+        }
+        string::view $c = guard $chunk else {
+            break;
+        }
+        $all->append($c->bytes, $c->size);
+    }
+    assert($all == "1\tx\n2\ty\n");
+    assert($out->outcome()->affectedRows == 2);
+
+    assert(failsExec($db->exec('COPY t FROM STDIN'))->is(.queryCanceled));
+    $db->close();
+    $f->server->join();
+}
+
+test a_pipeline_reports_where_it_failed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        // one distinct SQL: prepared once for all three
+        array<Msg> $prep = $w->batch();
+        assert($prep->count() == 3 && $prep[0]->type == PARSE);
+        array<uint32> $types = [OID_INT8];
+        $w->describe($types, '');
+        $w->ready();
+        assert($w->kinds() == 'BEBEBES');
+        $w->send(BIND_COMPLETE, '');
+        $w->send(COMMAND_COMPLETE, commandComplete('INSERT 0 1'));
+        $w->send(BIND_COMPLETE, '');
+        $w->error('23505', 'duplicate key value violates unique constraint "t_pkey"');
+        $w->ready();
+        // the same pipeline again: cached now, one round trip
+        assert($w->kinds() == 'BEBEBES');
+        int32 $i = 0;
+        while ($i < 3) {
+            $w->send(BIND_COMPLETE, '');
+            $w->send(COMMAND_COMPLETE, commandComplete('INSERT 0 1'));
+            $i = $i + 1;
+        }
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Pipeline $p = $db->pipeline();
+    $p->add('INSERT INTO t VALUES (:id)', ['id' => 1]);
+    $p->add('INSERT INTO t VALUES (:id)', ['id' => 1]);
+    $p->add('INSERT INTO t VALUES (:id)', ['id' => 2]);
+    assert($p->count() == 3);
+    assert($p->run()->failure()->is(.uniqueViolation));
+    assert(($p->failedAt() ?? 9) == 1);
+    array<pgsql::ResultSet> $done = guard $p->run() else ($e) {
+        die("{$e}");
+    }
+    assert($done->count() == 3);
+    assert($p->failedAt() == null);
+    // a value that cannot be bound is refused before anything is sent
+    pgsql::Pipeline $bad = $db->pipeline();
+    $bad->add('INSERT INTO t VALUES (:id)', ['nope' => 1]);
+    assert($bad->run()->failure()->name() == 'invalid');
+    assert(($bad->failedAt() ?? 9) == 0);
+    $db->close();
+    $f->server->join();
+}
+
+test a_row_that_does_not_decode_closes_the_connection
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['n:23'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        $w->batch();
+        $w->send(BIND_COMPLETE, '');
+        // a binary int4 of three bytes
+        array<string> $row = ['abc'];
+        $w->send(DATA_ROW, dataRow($row));
+        $w->send(COMMAND_COMPLETE, commandComplete('SELECT 1'));
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    assert(failsQuery($db->query('SELECT n FROM t'))->name() == 'malformed');
+    assert(!$db->alive());
+    $f->server->join();
+}
+
+test a_server_that_hangs_up_mid_rows_is_a_transport_error
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(QUERY);
+        array<string> $spec = ['n:25'];
+        $w->send(ROW_DESCRIPTION, columns($spec));
+        array<string> $row = ['a'];
+        $w->send(DATA_ROW, dataRow($row));
+    });
+    pgsql::Connection $db = login($f);
+    result<array<pgsql::ResultSet>, pgsql::Error> $r = $db->batch('SELECT n FROM t');
+    assert($r->failure()->name() == 'transport');
+    assert(!$db->alive());
+    $f->server->join();
+}
+
+test an_unexpected_message_is_malformed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->expect(QUERY);
+        $w->send(PORTAL_SUSPENDED, '');
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    assert(failsExec($db->exec('SELECT 1'))->name() == 'malformed');
+    assert(!$db->alive());
+    $f->server->join();
+}
+
+test statements_prepare_bind_and_close_with_the_next_command
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        array<Msg> $prep = $w->batch();
+        string $name = parsed($prep[0]);
+        assert($name->starts('p'));
+        array<uint32> $types = [OID_INT4, OID_TEXT];
+        $w->describe($types, '');
+        $w->ready();
+        assert($w->kinds() == 'BES');
+        $w->send(BIND_COMPLETE, '');
+        $w->send(COMMAND_COMPLETE, commandComplete('INSERT 0 1'));
+        $w->ready();
+        // closed with the next command, ahead of it
+        array<Msg> $next = $w->batch();
+        assert($next[0]->type == CLOSE && $next[0]->body->contains($name));
+        $w->send(CLOSE_COMPLETE, '');
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Statement $st = prepared($db->prepare('INSERT INTO t VALUES (:a, :b)'));
+    assert($st->params() == 2);
+    assert($st->types()[1] == pgsql::PgType::text);
+    assert($st->names[1] == 'b');
+    did($st->exec(['a' => 1, 'b' => 'x']));
+    $st->close();
+    assert(failsExec($st->exec(['a' => 1, 'b' => 'x']))->name() == 'invalid');
+    fine($db->ping());
+    $db->close();
+    $f->server->join();
+}

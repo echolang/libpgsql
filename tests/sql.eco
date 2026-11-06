@@ -1,0 +1,88 @@
+/**
+ * The `:name` rewrite: what it changes, and every kind of text it has to leave alone.
+ */
+
+namespace pgsql::protocol;
+
+internal function rewritten(const string& $sql) : Placeholders
+{
+    Placeholders $p = guard placeholders($sql) else ($e) {
+        die("{$sql}: {$e}");
+    }
+    return $p;
+}
+
+test named_placeholders_become_numbered
+{
+    Placeholders $p = rewritten('SELECT * FROM t WHERE a = :a AND b = :b_2');
+    assert($p->sql == 'SELECT * FROM t WHERE a = $1 AND b = $2');
+    assert($p->names->count() == 2);
+    assert($p->names[1] == 'b_2');
+    assert($p->count == 2);
+}
+
+test a_repeated_name_is_one_parameter
+{
+    Placeholders $p = rewritten('SELECT :x + :y + :x');
+    assert($p->sql == 'SELECT $1 + $2 + $1');
+    assert($p->names->count() == 2);
+    assert($p->count == 2);
+}
+
+test casts_and_slices_are_not_placeholders
+{
+    Placeholders $p = rewritten('SELECT :v::int, a[1:n], a[lo:hi], x::text[], :w::numeric(10,2)');
+    assert($p->sql == 'SELECT $1::int, a[1:n], a[lo:hi], x::text[], $2::numeric(10,2)');
+    assert($p->names->count() == 2);
+}
+
+test quoted_text_identifiers_and_comments_stay
+{
+    string $sql = "SELECT ':no', \"col:no\", E'it\\'s :no', 'it''s :no' -- :no\n, /* :no /* :nested */ :no */ :yes";
+    Placeholders $p = rewritten($sql);
+    assert($p->names->count() == 1);
+    assert($p->names[0] == 'yes');
+    assert($p->sql->ends('*/ $1'));
+    assert($p->sql->contains("E'it\\'s :no'"));
+}
+
+test dollar_quoted_bodies_stay
+{
+    Placeholders $p = rewritten('DO $$ BEGIN PERFORM :no; END $$; SELECT $body$ :no $x$ $body$, :yes');
+    assert($p->names->count() == 1);
+    assert($p->sql->ends('$body$, $1'));
+    // an identifier may hold a $: it starts no dollar quote
+    Placeholders $q = rewritten('SELECT a$b, :yes');
+    assert($q->sql == 'SELECT a$b, $1');
+}
+
+test native_placeholders_pass_through
+{
+    Placeholders $p = rewritten('SELECT $1, $3, $2');
+    assert($p->sql == 'SELECT $1, $3, $2');
+    assert($p->names->empty());
+    assert($p->count == 3);
+    Placeholders $none = rewritten('SELECT 1');
+    assert($none->count == 0);
+}
+
+test mixing_and_bad_numbers_are_refused
+{
+    assert(placeholders('SELECT $1, :a')->failed());
+    assert(placeholders('SELECT $0')->failed());
+    assert(placeholders('SELECT $70000')->failed());
+}
+
+test question_marks_are_left_for_jsonb
+{
+    Placeholders $p = rewritten("SELECT data ? 'k', data ?| array['a'] FROM t WHERE id = :id");
+    assert($p->sql == "SELECT data ? 'k', data ?| array['a'] FROM t WHERE id = $1");
+}
+
+test unterminated_quotes_run_to_the_end
+{
+    Placeholders $p = rewritten("SELECT 'open :no");
+    assert($p->names->empty());
+    Placeholders $c = rewritten('SELECT 1 /* open :no');
+    assert($c->names->empty());
+}

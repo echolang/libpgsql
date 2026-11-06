@@ -1,0 +1,350 @@
+namespace pgsql;
+
+/**
+ * The server's SQLSTATE, for the states a program branches on. Every other state is `other` and
+ * still carries its code in `value()`; `ServerError->state` always has the five characters. The
+ * number is the state read as base 36, so `from(sqlstate('23505'))` names it.
+ */
+public enum ErrorCode : uint32
+{
+    case successfulCompletion = 0;            // 00000
+    case warning = 46656;                     // 01000
+    case connectionException = 373248;        // 08000
+    case connectionFailure = 373254;          // 08006
+    case protocolViolation = 405649;          // 08P01
+    case featureNotSupported = 466560;        // 0A000
+    case dataException = 3452544;             // 22000
+    case stringDataRightTruncation = 3452545; // 22001
+    case numericValueOutOfRange = 3452547;    // 22003
+    case invalidDatetimeFormat = 3452551;     // 22007
+    case datetimeFieldOverflow = 3452552;     // 22008
+    case divisionByZero = 3452582;            // 22012
+    case invalidParameterValue = 3452619;     // 22023
+    case invalidTextRepresentation = 3484946; // 22P02
+    case integrityConstraintViolation = 3499200; // 23000
+    case restrictViolation = 3499201;         // 23001
+    case notNullViolation = 3505682;          // 23502
+
+    /**
+     * A foreign key does not match, or a row is still referenced.
+     */
+    case foreignKeyViolation = 3505683;       // 23503
+
+    /**
+     * A duplicate key.
+     */
+    case uniqueViolation = 3505685;           // 23505
+    case checkViolation = 3505720;            // 23514
+    case exclusionViolation = 3531601;        // 23P01
+    case invalidTransactionState = 3592512;   // 25000
+    case activeSqlTransaction = 3592513;      // 25001
+    case readOnlySqlTransaction = 3592518;    // 25006
+
+    /**
+     * An earlier statement failed: the transaction only takes ROLLBACK now.
+     */
+    case inFailedSqlTransaction = 3624914;    // 25P02
+    case invalidSqlStatementName = 3639168;   // 26000
+    case invalidAuthorization = 3732480;      // 28000
+    case invalidPassword = 3764881;           // 28P01
+    case invalidCatalogName = 5645376;        // 3D000
+    case invalidSchemaName = 5738688;         // 3F000
+
+    /**
+     * Another transaction changed what this one read. Retry the whole transaction.
+     */
+    case serializationFailure = 6718465;      // 40001
+
+    /**
+     * Deadlock. The server rolled this transaction back. Retry it.
+     */
+    case deadlockDetected = 6750865;          // 40P01
+    case insufficientPrivilege = 6818257;     // 42501
+    case syntaxError = 6819553;               // 42601
+    case ambiguousColumn = 6820850;           // 42702
+    case undefinedColumn = 6820851;           // 42703
+    case undefinedObject = 6820852;           // 42704
+    case duplicateObject = 6820884;           // 42710
+    case datatypeMismatch = 6822148;          // 42804
+    case undefinedFunction = 6822435;         // 42883
+    case undefinedTable = 6844177;            // 42P01
+    case duplicateTable = 6844183;            // 42P07
+    case diskFull = 8539344;                  // 53100
+    case outOfMemory = 8540640;               // 53200
+    case tooManyConnections = 8541936;        // 53300
+    case objectInUse = 8631366;               // 55006
+    case lockNotAvailable = 8663763;          // 55P03
+
+    /**
+     * The statement was cancelled: a cancel request, or `statement_timeout`.
+     */
+    case queryCanceled = 8724712;             // 57014
+    case adminShutdown = 8757073;             // 57P01
+    case crashShutdown = 8757074;             // 57P02
+    case cannotConnectNow = 8757075;          // 57P03
+    case databaseDropped = 8757076;           // 57P04
+    case idleSessionTimeout = 8757077;        // 57P05
+    case raiseException = 41990401;           // P0001
+    case internalError = 56966976;            // XX000
+
+    /**
+     * A state this library does not name. `value()` is its number.
+     */
+    case other;
+}
+
+/**
+ * A five-character SQLSTATE as the number `ErrorCode` uses: each character a base 36 digit.
+ */
+public function sqlstate(const string& $state) : uint32
+{
+    uint32 $v = 0;
+    usize $i = 0;
+    while ($i < $state->size()) {
+        uint8 $c = $state->byte($i);
+        uint32 $d = 0;
+        if ($c >= 48 && $c <= 57) {
+            $d = ($c - 48) as uint32;
+        } else if ($c >= 65 && $c <= 90) {
+            $d = ($c - 55) as uint32;
+        } else if ($c >= 97 && $c <= 122) {
+            $d = ($c - 87) as uint32;
+        }
+        $v = $v * 36 + $d;
+        $i = $i + 1;
+    }
+    return $v;
+}
+
+/**
+ * An ErrorResponse or a NoticeResponse: every field the server sent. Fields it left out are empty
+ * (and `position` 0).
+ */
+public struct ServerError
+{
+    public const ErrorCode $code = ErrorCode::from(0);
+
+    /**
+     * `ERROR`, `FATAL` or `PANIC` for an error; `WARNING`, `NOTICE`, `INFO`, `DEBUG` or `LOG` for
+     * a notice. Never translated.
+     */
+    public const string $severity = '';
+
+    /**
+     * The five-character SQLSTATE (`23505`, `40001`).
+     */
+    public const string $state = '';
+    public const string $message = '';
+    public const string $detail = '';
+    public const string $hint = '';
+
+    /**
+     * Where in the SQL the error is, counted in characters from 1. Zero when the server gave none.
+     */
+    public const uint32 $position = 0;
+
+    /**
+     * The call stack inside the server: a function, a trigger.
+     */
+    public const string $where = '';
+    public const string $schema = '';
+    public const string $table = '';
+    public const string $column = '';
+    public const string $dataType = '';
+    public const string $constraint = '';
+
+    /**
+     * The server source routine that raised it. For a bug report.
+     */
+    public const string $routine = '';
+}
+
+/**
+ * Why a login could not be completed on this side.
+ */
+public enum AuthError
+{
+    /**
+     * The server asked for a method this client does not speak: Kerberos, GSSAPI, SSPI, or a SASL
+     * mechanism other than SCRAM-SHA-256.
+     */
+    case unsupported(string $method);
+
+    /**
+     * The server asked for the password in clear text over TCP without TLS. Allow it with
+     * `Options->allowCleartext`, or connect over a unix socket.
+     */
+    case needsSecureTransport;
+
+    /**
+     * SCRAM went wrong on the server's side: a message that does not parse, a nonce that does not
+     * extend ours, or a signature that proves the server does not know the password.
+     */
+    case scram(string $why);
+
+    /**
+     * The sentence: which method, or what to set.
+     */
+    public const function message() : string
+    {
+        return match ($this) {
+            AuthError::unsupported($m) => "the server asked for {$m} authentication, which is not supported",
+            AuthError::needsSecureTransport => 'the server asked for the password in clear text over TCP: set Options->allowCleartext, or connect over a unix socket',
+            AuthError::scram($w) => "SCRAM: {$w}",
+        };
+    }
+}
+
+#[docs::see: ["pgsql::ErrorCode", "pgsql::ServerError"]]
+
+/**
+ * What can go wrong talking to PostgreSQL. Cases a caller branches on: the server said no
+ * (`server`), the connection is gone (`transport`, `timeout`, `closed`), login failed on this side
+ * (`auth`), or the call itself was wrong (`invalid`). `"{$e}"` is the sentence.
+ *
+ * ```echo
+ * guard $db->exec($sql) else ($e) {
+ *     if ($e->is(.uniqueViolation)) {
+ *         echo $e->name();    // server
+ *     }
+ * }
+ * ```
+ */
+public enum Error
+{
+    /**
+     * The server refused the command, with its SQLSTATE, message and the rest.
+     */
+    case server(ServerError $error);
+
+    /**
+     * The socket failed: refused, reset, closed by the peer, and so on.
+     */
+    case transport(tcp::Error $error);
+
+    /**
+     * The deadline passed first. A running statement is cancelled; when the server does not
+     * answer the cancel in time, the connection closes.
+     */
+    case timeout;
+
+    /**
+     * The connection is closed, or an earlier failure left it unusable.
+     */
+    case closed;
+
+    /**
+     * A stream, a COPY or a pipeline is still open on this connection: finish it first.
+     */
+    case busy;
+
+    /**
+     * Login failed on this side: an unsupported method, a cleartext password over TCP, or a
+     * server whose SCRAM proof is wrong.
+     */
+    case auth(AuthError $error);
+
+    /**
+     * The server sent something that does not parse as the protocol.
+     */
+    case malformed(string $why);
+
+    /**
+     * A message over `Options->maxMessage`.
+     */
+    case tooLarge(uint64 $size);
+
+    /**
+     * The call could not be made as written: a value without a placeholder, a placeholder
+     * without a value, a URL that does not parse.
+     */
+    case invalid(string $why);
+
+    /**
+     * No pooled connection came free before the deadline.
+     */
+    case exhausted;
+
+    /**
+     * True when the server answered with `$code`.
+     */
+    public const function is(ErrorCode $code) : bool
+    {
+        ErrorCode $have = guard $this->code() else {
+            return false;
+        }
+        return $have == $code;
+    }
+
+    /**
+     * The server's code, or null when the error did not come from the server.
+     */
+    public const function code() : ErrorCode?
+    {
+        return $this->server()?->code;
+    }
+
+    /**
+     * The five-character SQLSTATE the server sent (`23505` for a duplicate key, `40001` for a
+     * serialization failure), or null when the error did not come from the server.
+     */
+    public const function state() : string?
+    {
+        return $this->server()?->state;
+    }
+
+    /**
+     * The whole server error, or null when the error did not come from the server.
+     */
+    public const function server() : ServerError?
+    {
+        return match ($this) {
+            Error::server($s) => $s,
+            else => null,
+        };
+    }
+
+    /**
+     * True when running the same transaction again may succeed: a serialization failure or a
+     * deadlock. The server rolled the transaction back.
+     */
+    public const function retryable() : bool
+    {
+        return $this->is(.serializationFailure) || $this->is(.deadlockDetected);
+    }
+
+    /**
+     * The case's name: `server`, `timeout` and so on. For a log line or a test.
+     */
+    public const function name() : string
+    {
+        return match ($this) {
+            Error::server($s) => 'server',
+            Error::transport($t) => 'transport',
+            Error::timeout => 'timeout',
+            Error::closed => 'closed',
+            Error::busy => 'busy',
+            Error::auth($a) => 'auth',
+            Error::malformed($w) => 'malformed',
+            Error::tooLarge($n) => 'tooLarge',
+            Error::invalid($w) => 'invalid',
+            Error::exhausted => 'exhausted',
+        };
+    }
+
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::server($s) => str::from($s),
+            Error::transport($t) => $t->message(),
+            Error::timeout => 'timed out',
+            Error::closed => 'the connection is closed',
+            Error::busy => 'a stream, COPY or pipeline is still open on this connection',
+            Error::auth($a) => $a->message(),
+            Error::malformed($w) => "malformed message: {$w}",
+            Error::tooLarge($n) => "a message of {$n} bytes is over the limit",
+            Error::invalid($w) => $w,
+            Error::exhausted => 'no pooled connection came free in time',
+        };
+    }
+}

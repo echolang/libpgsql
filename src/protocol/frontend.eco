@@ -1,0 +1,218 @@
+/**
+ * The messages a client sends, appended to an outgoing buffer: several of them go out in one
+ * write. Each starts with its type byte and a length that counts itself and the body, so every
+ * builder works out its body's size before writing it.
+ */
+
+namespace pgsql::protocol;
+
+/**
+ * A message's type byte and length, for a body of `$size` bytes.
+ */
+internal function head(string& $out, uint8 $type, usize $size) : void
+{
+    $out->push($type);
+    tcp::wire::putBe32($out, ($size + 4) as uint32);
+}
+
+internal function putCString(string& $out, const string& $s) : void
+{
+    $out->append($s);
+    $out->push(0);
+}
+
+/**
+ * The StartupMessage: no type byte, the protocol version, then name/value pairs.
+ */
+internal function startup(string& $out, uint32 $protocol, const ordered_map<string, string>& $params) : void
+{
+    usize $size = 4 + 4 + 1;
+    foreach ($params as $k => $v) {
+        $size = $size + $k->size() + 1 + $v->size() + 1;
+    }
+    tcp::wire::putBe32($out, $size as uint32);
+    tcp::wire::putBe32($out, $protocol);
+    foreach ($params as $k => $v) {
+        putCString($out, $k);
+        putCString($out, $v);
+    }
+    $out->push(0);
+}
+
+/**
+ * A PasswordMessage: the cleartext password, or the md5 answer.
+ */
+internal function password(string& $out, const string& $pw) : void
+{
+    head($out, PASSWORD, $pw->size() + 1);
+    putCString($out, $pw);
+}
+
+/**
+ * SASLInitialResponse: the chosen mechanism and its first message.
+ */
+internal function saslInitial(string& $out, const string& $mechanism, const string& $data) : void
+{
+    head($out, PASSWORD, $mechanism->size() + 1 + 4 + $data->size());
+    putCString($out, $mechanism);
+    tcp::wire::putBe32($out, $data->size() as uint32);
+    $out->append($data);
+}
+
+/**
+ * SASLResponse: the next SASL message, as it is.
+ */
+internal function saslResponse(string& $out, const string& $data) : void
+{
+    head($out, PASSWORD, $data->size());
+    $out->append($data);
+}
+
+/**
+ * A simple Query: one or more statements, no parameters, rows in text.
+ */
+internal function query(string& $out, const string& $sql) : void
+{
+    head($out, QUERY, $sql->size() + 1);
+    putCString($out, $sql);
+}
+
+/**
+ * Parse `$sql` into statement `$name` (empty for the unnamed one), with parameter types. A type of
+ * 0 lets the server infer it.
+ */
+internal function parse(string& $out, const string& $name, const string& $sql, const array<uint32>& $types) : void
+{
+    head($out, PARSE, $name->size() + 1 + $sql->size() + 1 + 2 + 4 * $types->count());
+    putCString($out, $name);
+    putCString($out, $sql);
+    tcp::wire::putBe16($out, $types->count() as uint16);
+    foreach ($types as $t) {
+        tcp::wire::putBe32($out, $t);
+    }
+}
+
+/**
+ * Bind statement `$statement` to portal `$portal`. `$values` holds the parameters as they travel:
+ * each an int32 length (-1 for NULL) and its bytes. One format code each, for the parameters and
+ * for the result columns; a single code stands for all of them, none means text.
+ */
+internal function bind(string& $out, const string& $portal, const string& $statement, const array<int16>& $paramFormats, usize $count, const string& $values, const array<int16>& $resultFormats) : void
+{
+    usize $size = $portal->size() + 1 + $statement->size() + 1 + 2 + 2 * $paramFormats->count() + 2 + $values->size() + 2 + 2 * $resultFormats->count();
+    head($out, BIND, $size);
+    putCString($out, $portal);
+    putCString($out, $statement);
+    tcp::wire::putBe16($out, $paramFormats->count() as uint16);
+    foreach ($paramFormats as $f) {
+        tcp::wire::putBe16($out, $f as uint16);
+    }
+    tcp::wire::putBe16($out, $count as uint16);
+    $out->append($values);
+    tcp::wire::putBe16($out, $resultFormats->count() as uint16);
+    foreach ($resultFormats as $r) {
+        tcp::wire::putBe16($out, $r as uint16);
+    }
+}
+
+/**
+ * The format codes a Bind sends for values formatted `$each`: none when all are text, one when
+ * all are binary, else `$each` as it is.
+ */
+internal function formatCodes(mv array<int16> $each) : array<int16>
+{
+    usize $binaries = 0;
+    foreach ($each as $f) {
+        if ($f == BINARY) {
+            $binaries = $binaries + 1;
+        }
+    }
+    if ($binaries == 0) {
+        return array<int16>();
+    }
+    if ($binaries == $each->count()) {
+        return [BINARY];
+    }
+    return $each;
+}
+
+/**
+ * Describe a statement (`STATEMENT`) or a portal (`PORTAL`).
+ */
+internal function describe(string& $out, uint8 $what, const string& $name) : void
+{
+    head($out, DESCRIBE, 1 + $name->size() + 1);
+    $out->push($what);
+    putCString($out, $name);
+}
+
+/**
+ * Execute portal `$portal`, all its rows when `$maxRows` is 0.
+ */
+internal function execute(string& $out, const string& $portal, uint32 $maxRows) : void
+{
+    head($out, EXECUTE, $portal->size() + 1 + 4);
+    putCString($out, $portal);
+    tcp::wire::putBe32($out, $maxRows);
+}
+
+/**
+ * Close a statement (`STATEMENT`) or a portal (`PORTAL`) on the server.
+ */
+internal function close(string& $out, uint8 $what, const string& $name) : void
+{
+    head($out, CLOSE, 1 + $name->size() + 1);
+    $out->push($what);
+    putCString($out, $name);
+}
+
+/**
+ * Sync: ends an extended query. The server answers ReadyForQuery, after an error too.
+ */
+internal function sync(string& $out) : void
+{
+    head($out, SYNC, 0);
+}
+
+internal function flush(string& $out) : void
+{
+    head($out, FLUSH, 0);
+}
+
+internal function terminate(string& $out) : void
+{
+    head($out, TERMINATE, 0);
+}
+
+internal function copyData(string& $out, string::view $data) : void
+{
+    head($out, COPY_DATA, $data->size);
+    $out->append($data->bytes, $data->size);
+}
+
+internal function copyDone(string& $out) : void
+{
+    head($out, COPY_DONE, 0);
+}
+
+/**
+ * CopyFail: abandon a COPY FROM STDIN. The server answers with an error carrying `$reason`.
+ */
+internal function copyFail(string& $out, const string& $reason) : void
+{
+    head($out, COPY_FAIL, $reason->size() + 1);
+    putCString($out, $reason);
+}
+
+/**
+ * A CancelRequest, sent on a connection of its own: the session's process id and secret key.
+ */
+internal function cancelRequest(uint32 $pid, const string& $secret) : string
+{
+    string $out = '';
+    tcp::wire::putBe32($out, (12 + $secret->size()) as uint32);
+    tcp::wire::putBe32($out, CANCEL_REQUEST);
+    tcp::wire::putBe32($out, $pid);
+    $out->append($secret);
+    return $out;
+}

@@ -1,0 +1,77 @@
+/**
+ * Message types, authentication codes and protocol numbers of the frontend/backend protocol.
+ */
+
+namespace pgsql::protocol;
+
+// protocol versions, major in the high 16 bits
+internal const uint32 PROTOCOL_3_0 = 196608;
+internal const uint32 PROTOCOL_3_2 = 196610;
+internal const uint32 CANCEL_REQUEST = 80877102;
+internal const uint32 SSL_REQUEST = 80877103;
+
+// backend messages
+internal const uint8 AUTH = 82;              // R
+internal const uint8 BACKEND_KEY = 75;       // K
+internal const uint8 PARAMETER_STATUS = 83;  // S
+internal const uint8 READY = 90;             // Z
+internal const uint8 ROW_DESCRIPTION = 84;   // T
+internal const uint8 DATA_ROW = 68;          // D
+internal const uint8 COMMAND_COMPLETE = 67;  // C
+internal const uint8 EMPTY_QUERY = 73;       // I
+internal const uint8 ERROR = 69;             // E
+internal const uint8 NOTICE = 78;            // N
+internal const uint8 NOTIFICATION = 65;      // A
+internal const uint8 PARSE_COMPLETE = 49;    // 1
+internal const uint8 BIND_COMPLETE = 50;     // 2
+internal const uint8 CLOSE_COMPLETE = 51;    // 3
+internal const uint8 NO_DATA = 110;          // n
+internal const uint8 PARAMETER_DESCRIPTION = 116; // t
+internal const uint8 PORTAL_SUSPENDED = 115; // s
+internal const uint8 COPY_IN = 71;           // G
+internal const uint8 COPY_OUT = 72;          // H
+internal const uint8 COPY_BOTH = 87;         // W
+internal const uint8 COPY_DATA = 100;        // d
+internal const uint8 COPY_DONE = 99;         // c
+internal const uint8 NEGOTIATE = 118;        // v
+
+// frontend messages
+internal const uint8 PASSWORD = 112;         // p, also SASL
+internal const uint8 QUERY = 81;             // Q
+internal const uint8 PARSE = 80;             // P
+internal const uint8 BIND = 66;              // B
+internal const uint8 DESCRIBE = 68;          // D
+internal const uint8 EXECUTE = 69;           // E
+internal const uint8 SYNC = 83;              // S
+internal const uint8 FLUSH = 72;             // H
+internal const uint8 CLOSE = 67;             // C
+internal const uint8 TERMINATE = 88;         // X
+internal const uint8 COPY_FAIL = 102;        // f
+
+// what Describe and Close name
+internal const uint8 STATEMENT = 83;         // S
+internal const uint8 PORTAL = 80;            // P
+
+// authentication request codes
+internal const uint32 AUTH_OK = 0;
+internal const uint32 AUTH_KERBEROS = 2;
+internal const uint32 AUTH_CLEARTEXT = 3;
+internal const uint32 AUTH_MD5 = 5;
+internal const uint32 AUTH_GSS = 7;
+internal const uint32 AUTH_GSS_CONTINUE = 8;
+internal const uint32 AUTH_SSPI = 9;
+internal const uint32 AUTH_SASL = 10;
+internal const uint32 AUTH_SASL_CONTINUE = 11;
+internal const uint32 AUTH_SASL_FINAL = 12;
+
+// ReadyForQuery transaction status
+internal const uint8 IDLE = 73;              // I
+internal const uint8 IN_TRANSACTION = 84;    // T
+internal const uint8 FAILED = 69;            // E
+
+// a message's header: type byte and a 4-byte length that counts itself
+internal const usize HEADER = 5;
+
+// format codes
+internal const int16 TEXT = 0;
+internal const int16 BINARY = 1;

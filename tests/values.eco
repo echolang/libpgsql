@@ -1,0 +1,276 @@
+/**
+ * Values both ways, no server: the calendar arithmetic, every type's text and binary form, arrays,
+ * and what a value looks like as text and inside a COPY line.
+ */
+
+namespace pgsql::protocol;
+
+use pgsql::{Value, Date, Time, DateTime, Interval, Uuid};
+
+internal function bin(const Value& $v, uint32 $oid) : string
+{
+    string $out = '';
+    bool $done = guard binaryOf($v, shape($oid), $oid, $out) else ($e) {
+        die("binaryOf: {$e}");
+    }
+    assert($done);
+    // past the length
+    return $out->sub(4, $out->size() - 4);
+}
+
+internal function back(const string& $bytes, uint32 $oid) : Value
+{
+    Value $v = guard binaryValue(shape($oid), $oid, $bytes) else ($e) {
+        die("binaryValue: {$e}");
+    }
+    return $v;
+}
+
+internal function fromText(const string& $text, uint32 $oid) : Value
+{
+    Value $v = guard textValue(shape($oid), $oid, $text) else ($e) {
+        die("textValue: {$e}");
+    }
+    return $v;
+}
+
+test calendar_days_round_trip
+{
+    int64 $d = -800000;
+    while ($d < 800000) {
+        Date $date = Date::fromUnixDays($d);
+        assert($date->unixDays() == $d);
+        $d = $d + 997;
+    }
+    assert(Date(1970, 1, 1)->unixDays() == 0);
+    assert(Date(2000, 1, 1)->unixDays() == pgsql::PG_EPOCH_DAYS);
+    assert(Date(2024, 2, 29)->unixDays() == 19782);
+    Date $leap = Date::fromUnixDays(19782);
+    assert($leap->month == 2 && $leap->day == 29);
+    assert(Date(0, 12, 31)->unixDays() + 1 == Date(1, 1, 1)->unixDays());
+}
+
+test datetime_from_unix_micros
+{
+    DateTime $t = DateTime(unixMicros: -1);
+    assert("{$t}" == '1969-12-31 23:59:59.999999');
+    DateTime $u = DateTime(unixMicros: 1709211845500000);
+    assert("{$u}" == '2024-02-29 13:04:05.5');
+    assert($u->unixMicros() == 1709211845500000);
+}
+
+test text_forms_parse_and_print
+{
+    assert(str::from(Date::parse('0044-03-15 BC') ?? Date()) == '0044-03-15 BC');
+    assert((Date::parse('0044-03-15 BC') ?? Date())->year == -43);
+    assert(str::from(Date::parse('12345-01-02') ?? Date()) == '12345-01-02');
+    assert(Date::parse('2024-13-01') == null);
+    assert(Date::parse('2024-1-01') == null);
+    assert((Date::parse('infinity') ?? Date())->infinite());
+    assert(str::from(Time::parse('24:00:00') ?? Time()) == '24:00:00');
+    assert(str::from(Time::parse('01:02:03.1') ?? Time()) == '01:02:03.1');
+    assert(Time::parse('01:02') == null);
+    assert(Time::parse('01:02:03.1234567') == null);
+    // a TIMESTAMPTZ moves to UTC, whatever zone the session printed it in
+    assert(str::from(DateTime::parse('2024-02-29 13:04:05.5+02') ?? DateTime()) == '2024-02-29 11:04:05.5');
+    assert(str::from(DateTime::parse('2024-01-01 00:30:00-05:30') ?? DateTime()) == '2024-01-01 06:00:00');
+    assert(str::from(DateTime::parse('2024-01-01 00:00:00+05:30:15') ?? DateTime()) == '2023-12-31 18:29:45');
+    assert(str::from(DateTime::parse('0001-01-01 00:00:00+00 BC') ?? DateTime()) == '0001-01-01 00:00:00 BC');
+    assert(str::from(DateTime::parse('2024-01-01') ?? DateTime()) == '2024-01-01 00:00:00');
+    assert(DateTime::parse('2024-01-01 25:00:00') == null);
+    assert(DateTime::parse('2024-01-01 10:00:00+xx') == null);
+    assert(str::from(Interval::parse('1 year 2 mons 3 days 04:05:06.5') ?? Interval()) == '1 year 2 mons 3 days 04:05:06.5');
+    assert(str::from(Interval::parse('-1 days +02:03:00') ?? Interval()) == '-1 days +02:03:00');
+    assert(str::from(Interval::parse('00:00:00') ?? Interval()) == '00:00:00');
+    assert((Interval::parse('100:00:00') ?? Interval())->micros == 360000000000);
+    assert(Interval::parse('P1Y') == null);
+    assert(Interval::parse('3 fortnights') == null);
+    assert(str::from(Uuid::parse('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') ?? Uuid('')) == 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    assert(Uuid::parse('a0eebc999c0b4ef8bb6d6bb9bd380a11') != null);
+    assert(Uuid::parse('a0eebc99') == null);
+}
+
+test every_binary_form_round_trips
+{
+    array<Value> $values = [
+        Value::bool(true), Value::int(-2), Value::int(9223372036854775807), Value::float(0.1),
+        Value::text('héllo'), Value::bytes('raw'), Value::uuid(Uuid::parse('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11') ?? Uuid('')),
+        Value::date(Date(2024, 2, 29)), Value::date(Date::infinity()), Value::date(Date::past()),
+        Value::time(Time(23, 59, 59, 999999)), Value::timestamp(DateTime(1999, 12, 31, 23, 59, 59, 1)),
+        Value::timestamptz(DateTime::past()), Value::interval(Interval(-14, 3, 1500000)),
+    ];
+    array<uint32> $oids = [OID_BOOL, OID_INT2, OID_INT8, OID_FLOAT8, OID_TEXT, OID_BYTEA, OID_UUID, OID_DATE, OID_DATE, OID_DATE, OID_TIME, OID_TIMESTAMP, OID_TIMESTAMPTZ, OID_INTERVAL];
+    foreach ($values as $i => const &$v) {
+        Value $got = back(bin($v, $oids[$i]), $oids[$i]);
+        assert("{$got}" == "{$v}");
+    }
+    // the same instant as a TIMESTAMPTZ
+    Value $tz = back(bin(Value::timestamp(DateTime(2000, 1, 1)), OID_TIMESTAMPTZ), OID_TIMESTAMPTZ);
+    assert($tz->kind() == 'timestamptz');
+    assert("{$tz}" == '2000-01-01 00:00:00+00');
+    // jsonb carries a version byte
+    string $jb = '';
+    $jb->push(1);
+    $jb->append('{}');
+    assert((back($jb, OID_JSONB)->json() ?? '') == '{}');
+    assert(binaryValue(Shape::jsonb, OID_JSONB, '{}')->failed());
+}
+
+test binary_widths_are_checked
+{
+    assert(binaryValue(Shape::int4, OID_INT4, 'abc')->failed());
+    assert(binaryValue(Shape::int8, OID_INT8, 'abcd')->failed());
+    assert(binaryValue(Shape::float8, OID_FLOAT8, 'a')->failed());
+    assert(binaryValue(Shape::uuid, OID_UUID, 'short')->failed());
+    assert(binaryValue(Shape::interval, OID_INTERVAL, '12345678')->failed());
+    assert(binaryValue(Shape::boolean, OID_BOOL, '')->failed());
+}
+
+test values_that_do_not_fit_go_as_text_or_are_refused
+{
+    string $out = '';
+    // a text for an integer: no binary form, the server parses it
+    assert(!binaryOf(Value::text('42'), Shape::int4, OID_INT4, $out)->unwrap());
+    assert($out->empty());
+    assert(encode(Value::text('42'), OID_INT4, $out)->or(9) == TEXT);
+    assert(binaryOf(Value::int(40000), Shape::int2, OID_INT2, $out)->failed());
+    assert(binaryOf(Value::int(-1), Shape::oid, OID_OID, $out)->failed());
+    // an integer for a float travels as one
+    assert((back(bin(Value::int(3), OID_FLOAT8), OID_FLOAT8)->float() ?? 0.0) == 3.0);
+    // NULL is a length of -1
+    string $n = '';
+    encode(Value::none, OID_INT4, $n);
+    assert($n == unhexed('ffffffff'));
+}
+
+test text_values_of_every_shape
+{
+    assert(fromText('t', OID_BOOL)->bool() ?? false);
+    assert(textValue(Shape::boolean, OID_BOOL, 'x')->failed());
+    assert((fromText('-9223372036854775808', OID_INT8)->int() ?? 0) == -9223372036854775807 - 1);
+    assert(textValue(Shape::int8, OID_INT8, '9223372036854775808')->failed());
+    assert(textValue(Shape::int4, OID_INT4, '1x')->failed());
+    assert(str::from(fromText('NaN', OID_FLOAT8)) == 'NaN');
+    assert(str::from(fromText('-Infinity', OID_FLOAT8)) == '-Infinity');
+    assert((fromText('1.50', OID_NUMERIC)->numeric() ?? '') == '1.50');
+    assert((fromText('\\x00ff', OID_BYTEA)->bytes() ?? '') == unhexed('00ff'));
+    assert((fromText('a\\\\b\\001', OID_BYTEA)->bytes() ?? '') == "a\\b\x01");
+    assert(textValue(Shape::bytea, OID_BYTEA, '\\9')->failed());
+    // text that does not parse as its type comes back as text
+    assert(fromText('P1Y2M', OID_INTERVAL)->kind() == 'text');
+    assert(fromText('03/04/2024', OID_DATE)->kind() == 'text');
+    assert(fromText('10.0.0.1', 869)->kind() == 'text');
+}
+
+test text_arrays_parse
+{
+    Value $a = fromText('{1,NULL,3}', 1007);
+    assert("{$a}" == '{"1",NULL,"3"}');
+    Value $nested = fromText('{{"a","b"},{"c\\"d","NULL"}}', 1009);
+    array<Value> $rows = $nested->list() ?? array<Value>();
+    assert($rows->count() == 2);
+    array<Value> $second = $rows[1]->list() ?? array<Value>();
+    assert(($second[0]->text() ?? '') == 'c"d');
+    // a quoted NULL is the text NULL
+    assert(($second[1]->text() ?? '') == 'NULL');
+    assert(str::from(fromText('{}', 1007)) == '{}');
+    assert(str::from(fromText('[0:1]={7,8}', 1007)) == '{"7","8"}');
+    assert(str::from(fromText('{2024-01-01,infinity}', 1182)) == '{"2024-01-01","infinity"}');
+    assert(textArray('{1,2', Shape::int4, OID_INT4)->failed());
+    assert(textArray('{1,,2}', Shape::int4, OID_INT4)->failed());
+    assert(textArray('{"open}', Shape::text, OID_TEXT)->failed());
+    assert(textArray('{1}x', Shape::int4, OID_INT4)->failed());
+}
+
+test binary_arrays_round_trip
+{
+    array<Value> $flat = [Value::int(1), Value::none, Value::int(3)];
+    Value $list = Value::list($flat);
+    assert(str::from(back(bin($list, 1016), 1016)) == '{"1",NULL,"3"}');
+    array<Value> $r1 = [Value::text('a'), Value::text('b')];
+    array<Value> $r2 = [Value::text('c'), Value::text('d')];
+    array<Value> $grid = [Value::list($r1), Value::list($r2)];
+    assert(str::from(back(bin(Value::list($grid), 1009), 1009)) == '{{"a","b"},{"c","d"}}');
+    array<Value> $empty = array<Value>();
+    assert(str::from(back(bin(Value::list($empty), 1007), 1007)) == '{}');
+    // ragged rows are refused, a text element for int4[] goes as an array literal
+    array<Value> $short = [Value::text('e')];
+    array<Value> $ragged = [Value::list($r1), Value::list($short)];
+    string $out = '';
+    assert(binaryOf(Value::list($ragged), Shape::array, 1009, $out)->failed());
+    array<Value> $texts = [Value::text('1')];
+    assert(!binaryOf(Value::list($texts), Shape::array, 1007, $out)->unwrap());
+    // a lying dimension is malformed, not a huge allocation
+    string $bad = unhexed('00000001000000000000001700ffffff00000001');
+    assert(binaryArray($bad)->failed());
+    // a product of dimensions that cannot fit is refused before anything is sized by it
+    string $huge = unhexed('000000060000000000000017000003e800000001000003e800000001000003e800000001000003e800000001000003e800000001000003e80000000100000004');
+    assert(binaryArray($huge)->failed());
+    // an element type that is itself an array
+    string $nested = unhexed('0000000100000000000003ef0000000100000001');
+    assert(binaryArray($nested)->failed());
+}
+
+test review_fixes_hold
+{
+    // a level with a value and a list is refused, whichever comes first
+    array<Value> $inner = [Value::int(2), Value::int(3)];
+    array<Value> $mixed = [Value::int(1), Value::list($inner)];
+    string $out = '';
+    assert(binaryOf(Value::list($mixed), Shape::array, 1007, $out)->failed());
+    // json goes in binary to json and jsonb, jsonb with its version byte
+    assert((back(bin(Value::json('{"a":1}'), OID_JSONB), OID_JSONB)->json() ?? '') == '{"a":1}');
+    assert(bin(Value::text('[]'), OID_JSONB)->byte(0) == 1);
+    assert(bin(Value::json('[]'), OID_JSON) == '[]');
+    // a TIMESTAMP as text says it is UTC
+    assert(wireText(Value::timestamp(DateTime(2024, 1, 1, 12))) == '2024-01-01 12:00:00+00');
+    array<Value> $stamps = [Value::timestamp(DateTime(2024, 1, 1))];
+    assert(wireText(Value::list($stamps)) == '{"2024-01-01 00:00:00+00"}');
+    assert(textOf(Value::timestamp(DateTime(2024, 1, 1))) == '2024-01-01 00:00:00');
+}
+
+test text_of_values
+{
+    assert(floatText(0.1) == '0.1');
+    assert(floatText(1.0 / 3.0) == '0.33333333333333331');
+    assert(floatWire(0.1) == '0.10000000000000001');
+    assert(floatText(str::float('-Infinity') ?? 0.0) == '-Infinity');
+    string $n = '';
+    putInt($n, -9223372036854775807 - 1);
+    $n->push(32);
+    putInt($n, 0);
+    $n->push(32);
+    putInt($n, 42);
+    assert($n == '-9223372036854775808 0 42');
+    assert(str::from(Value::bytes(unhexed('00ff'))) == '\\x00ff');
+    assert(str::from(Value::bool(false)) == 'false');
+    assert(str::from(Value::none) == 'NULL');
+    assert(str::from(Value::timestamptz(DateTime(1, 1, 1))) == '0001-01-01 00:00:00+00');
+    assert(str::from(Value::timestamptz(DateTime(0, 1, 1))) == '0001-01-01 00:00:00+00 BC');
+    array<Value> $items = [Value::text('a"b\\c'), Value::none];
+    assert(str::from(Value::list($items)) == '{"a\\"b\\\\c",NULL}');
+}
+
+test copy_lines_escape
+{
+    array<Value> $row = [Value::int(1), Value::text("tab\there\nnew\\back\rcr"), Value::none, Value::float(0.5), Value::numeric('1.50')];
+    string $line = '';
+    pgsql::copyLine($row, $line);
+    assert($line == "1\ttab\\there\\nnew\\\\back\\rcr\t\\N\t0.5\t1.50\n");
+}
+
+test value_reads_cross_types_where_they_should
+{
+    assert((Value::int(3)->float() ?? 0.0) == 3.0);
+    assert((Value::numeric('2.5')->float() ?? 0.0) == 2.5);
+    assert((Value::int(7)->numeric() ?? '') == '7');
+    assert((Value::json('{}')->text() ?? '') == '{}');
+    assert((Value::text('x')->bytes() ?? '') == 'x');
+    assert(Value::text('x')->int() == null);
+    assert((Value::date(Date(2024, 1, 2))->datetime() ?? DateTime())->day == 2);
+    Value $v = 5;
+    assert($v->kind() == 'int');
+    int64? $missing = null;
+    Value $none = $missing;
+    assert($none->isNull());
+}

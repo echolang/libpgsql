@@ -1,0 +1,534 @@
+namespace pgsql;
+
+// days from 1970-01-01 to 2000-01-01, where PostgreSQL counts dates and timestamps from
+internal const int64 PG_EPOCH_DAYS = 10957;
+internal const int64 MICROS_PER_DAY = 86400000000;
+internal const int32 INFINITE_YEAR = 2147483647;
+internal const int32 PAST_YEAR = -2147483648;
+
+/**
+ * A DATE. Years are astronomical: year 0 is 1 BC, year -43 is 44 BC. `infinity` and
+ * `-infinity` are `Date::infinity()` and `Date::past()`.
+ */
+public struct Date
+{
+    public int32 $year = 1970;
+    public uint8 $month = 1;
+    public uint8 $day = 1;
+
+    /**
+     * The date `$days` days after 1970-01-01 (before it, when negative).
+     */
+    public static function fromUnixDays(int64 $days) : Date
+    {
+        // Howard Hinnant's civil_from_days
+        int64 $z = $days + 719468;
+        int64 $era = $z / 146097;
+        if ($z < 0) {
+            $era = ($z - 146096) / 146097;
+        }
+        int64 $doe = $z - $era * 146097;
+        int64 $yoe = ($doe - $doe / 1460 + $doe / 36524 - $doe / 146096) / 365;
+        int64 $y = $yoe + $era * 400;
+        int64 $doy = $doe - (365 * $yoe + $yoe / 4 - $yoe / 100);
+        int64 $mp = (5 * $doy + 2) / 153;
+        int64 $d = $doy - (153 * $mp + 2) / 5 + 1;
+        int64 $m = $mp + 3;
+        if ($mp >= 10) {
+            $m = $mp - 9;
+        }
+        if ($m <= 2) {
+            $y = $y + 1;
+        }
+        return Date($y as int32, $m as uint8, $d as uint8);
+    }
+
+    /**
+     * `infinity`: later than every other date.
+     */
+    public static function infinity() : Date
+    {
+        return Date(INFINITE_YEAR, 12, 31);
+    }
+
+    /**
+     * `-infinity`: earlier than every other date.
+     */
+    public static function past() : Date
+    {
+        return Date(PAST_YEAR, 1, 1);
+    }
+
+    /**
+     * True for `infinity` and `-infinity`.
+     */
+    public const function infinite() : bool
+    {
+        return $this->year == INFINITE_YEAR || $this->year == PAST_YEAR;
+    }
+
+    /**
+     * Days since 1970-01-01, negative before it.
+     */
+    public const function unixDays() : int64
+    {
+        // Howard Hinnant's days_from_civil
+        int64 $y = $this->year as int64;
+        int64 $m = $this->month as int64;
+        if ($m <= 2) {
+            $y = $y - 1;
+        }
+        int64 $era = $y / 400;
+        if ($y < 0) {
+            $era = ($y - 399) / 400;
+        }
+        int64 $yoe = $y - $era * 400;
+        int64 $shifted = $m - 3;
+        if ($m <= 2) {
+            $shifted = $m + 9;
+        }
+        int64 $doy = (153 * $shifted + 2) / 5 + ($this->day as int64) - 1;
+        int64 $doe = $yoe * 365 + $yoe / 4 - $yoe / 100 + $doy;
+        return $era * 146097 + $doe - 719468;
+    }
+
+    /**
+     * `YYYY-MM-DD`, with ` BC` for a year before 1, or `infinity`, as the server writes a DATE.
+     * Null when `$text` is not one.
+     */
+    public static function parse(const string& $text) : Date?
+    {
+        if ($text == 'infinity') {
+            Date? $inf = Date::infinity();
+            return $inf;
+        }
+        if ($text == '-infinity') {
+            Date? $past = Date::past();
+            return $past;
+        }
+        string $t = $text;
+        bool $bc = false;
+        if ($t->ends(' BC')) {
+            $bc = true;
+            $t = $t->sub(0, $t->size() - 3);
+        }
+        usize $n = $t->size();
+        if ($n < 10 || $t->byte($n - 3) != 45 || $t->byte($n - 6) != 45) {
+            return null;
+        }
+        uint32 $y = guard digits($t, 0, $n - 6) else {
+            return null;
+        }
+        uint32 $m = guard digits($t, $n - 5, 2) else {
+            return null;
+        }
+        uint32 $d = guard digits($t, $n - 2, 2) else {
+            return null;
+        }
+        if ($m == 0 || $m > 12 || $d == 0 || $d > 31) {
+            return null;
+        }
+        int32 $year = $y as int32;
+        if ($bc) {
+            $year = 1 - $year;
+        }
+        Date? $out = Date($year, $m as uint8, $d as uint8);
+        return $out;
+    }
+}
+
+/**
+ * A TIME of day, to the microsecond. `24:00:00` is allowed, as PostgreSQL allows it.
+ */
+public struct Time
+{
+    public uint8 $hour = 0;
+    public uint8 $minute = 0;
+    public uint8 $second = 0;
+    public uint32 $micro = 0;
+
+    /**
+     * The time `$micros` microseconds after midnight.
+     */
+    public static function fromMicros(int64 $micros) : Time
+    {
+        int64 $s = $micros / 1000000;
+        return Time(($s / 3600) as uint8, (($s / 60) % 60) as uint8, ($s % 60) as uint8, ($micros % 1000000) as uint32);
+    }
+
+    /**
+     * Microseconds since midnight.
+     */
+    public const function micros() : int64
+    {
+        return (($this->hour as int64) * 3600 + ($this->minute as int64) * 60 + ($this->second as int64)) * 1000000 + ($this->micro as int64);
+    }
+
+    /**
+     * `HH:MM:SS` with an optional `.ffffff`. Null when `$text` is not one.
+     */
+    public static function parse(const string& $text) : Time?
+    {
+        if ($text->size() < 8 || $text->byte(2) != 58 || $text->byte(5) != 58) {
+            return null;
+        }
+        uint32 $h = guard digits($text, 0, 2) else {
+            return null;
+        }
+        uint32 $m = guard digits($text, 3, 2) else {
+            return null;
+        }
+        uint32 $s = guard digits($text, 6, 2) else {
+            return null;
+        }
+        uint32 $micro = 0;
+        if ($text->size() > 8) {
+            uint32 $f = guard fraction($text, 8, $text->size() - 8) else {
+                return null;
+            }
+            $micro = $f;
+        }
+        if ($h > 24 || $m > 59 || $s > 60) {
+            return null;
+        }
+        Time? $out = Time($h as uint8, $m as uint8, $s as uint8, $micro);
+        return $out;
+    }
+}
+
+/**
+ * A TIMESTAMP, or a TIMESTAMPTZ in UTC, to the microsecond. Years are astronomical, as in
+ * `Date`. A TIMESTAMPTZ always arrives in UTC, and a `DateTime` sent to one is taken as UTC.
+ */
+public struct DateTime
+{
+    public int32 $year = 1970;
+    public uint8 $month = 1;
+    public uint8 $day = 1;
+    public uint8 $hour = 0;
+    public uint8 $minute = 0;
+    public uint8 $second = 0;
+    public uint32 $micro = 0;
+
+    public constructor(int32 $year = 1970, uint8 $month = 1, uint8 $day = 1, uint8 $hour = 0, uint8 $minute = 0, uint8 $second = 0, uint32 $micro = 0)
+    {
+        $this->year = $year;
+        $this->month = $month;
+        $this->day = $day;
+        $this->hour = $hour;
+        $this->minute = $minute;
+        $this->second = $second;
+        $this->micro = $micro;
+    }
+
+    /**
+     * Midnight on `$date`.
+     */
+    public constructor(midnight: Date $date)
+    {
+        $this->year = $date->year;
+        $this->month = $date->month;
+        $this->day = $date->day;
+    }
+
+    /**
+     * The instant `$micros` microseconds after 1970-01-01 00:00:00 UTC.
+     */
+    public constructor(unixMicros: int64 $micros)
+    {
+        int64 $days = $micros / MICROS_PER_DAY;
+        int64 $rest = $micros % MICROS_PER_DAY;
+        if ($rest < 0) {
+            $days = $days - 1;
+            $rest = $rest + MICROS_PER_DAY;
+        }
+        Date $d = Date::fromUnixDays($days);
+        Time $t = Time::fromMicros($rest);
+        $this->year = $d->year;
+        $this->month = $d->month;
+        $this->day = $d->day;
+        $this->hour = $t->hour;
+        $this->minute = $t->minute;
+        $this->second = $t->second;
+        $this->micro = $t->micro;
+    }
+
+    public static function infinity() : DateTime
+    {
+        return DateTime(INFINITE_YEAR, 12, 31, 23, 59, 59, 999999);
+    }
+
+    public static function past() : DateTime
+    {
+        return DateTime(PAST_YEAR, 1, 1);
+    }
+
+    public const function infinite() : bool
+    {
+        return $this->year == INFINITE_YEAR || $this->year == PAST_YEAR;
+    }
+
+    public const function date() : Date
+    {
+        return Date($this->year, $this->month, $this->day);
+    }
+
+    public const function time() : Time
+    {
+        return Time($this->hour, $this->minute, $this->second, $this->micro);
+    }
+
+    /**
+     * Microseconds since 1970-01-01 00:00:00.
+     */
+    public const function unixMicros() : int64
+    {
+        return $this->date()->unixDays() * MICROS_PER_DAY + $this->time()->micros();
+    }
+
+    /**
+     * `YYYY-MM-DD HH:MM:SS[.ffffff]`, with an offset (`+01`, `-05:30`) for a TIMESTAMPTZ, which
+     * is then moved to UTC, and ` BC` for a year before 1. A bare date is midnight. Null when
+     * `$text` is not one.
+     */
+    public static function parse(const string& $text) : DateTime?
+    {
+        if ($text == 'infinity') {
+            DateTime? $inf = DateTime::infinity();
+            return $inf;
+        }
+        if ($text == '-infinity') {
+            DateTime? $past = DateTime::past();
+            return $past;
+        }
+        string $t = $text;
+        bool $bc = false;
+        if ($t->ends(' BC')) {
+            $bc = true;
+            $t = $t->sub(0, $t->size() - 3);
+        }
+        usize $space = $t->find(' ');
+        if ($space == $t->size()) {
+            $space = $t->find('T');
+        }
+        string $datePart = $t->sub(0, $space);
+        if ($bc) {
+            $datePart->append(' BC');
+        }
+        Date $d = guard Date::parse($datePart) else {
+            return null;
+        }
+        if ($space == $t->size()) {
+            DateTime? $only = DateTime(midnight: $d);
+            return $only;
+        }
+        string $rest = $t->sub($space + 1, $t->size() - $space - 1);
+        // the clock runs to the zone: a sign after the seconds, or a Z
+        usize $zone = $rest->size();
+        usize $i = 8;
+        while ($i < $rest->size()) {
+            uint8 $c = $rest->byte($i);
+            if ($c == 43 || $c == 45 || $c == 90) {
+                $zone = $i;
+                break;
+            }
+            $i = $i + 1;
+        }
+        Time $clock = guard Time::parse($rest->sub(0, $zone)) else {
+            return null;
+        }
+        DateTime $local = DateTime($d->year, $d->month, $d->day, $clock->hour, $clock->minute, $clock->second, $clock->micro);
+        if ($zone == $rest->size()) {
+            DateTime? $plain = $local;
+            return $plain;
+        }
+        int64 $offset = guard offsetSeconds($rest->sub($zone, $rest->size() - $zone)) else {
+            return null;
+        }
+        DateTime? $utc = DateTime(unixMicros: $local->unixMicros() - $offset * 1000000);
+        return $utc;
+    }
+}
+
+/**
+ * An INTERVAL: months, days and microseconds, kept apart as PostgreSQL keeps them (a month is
+ * not a fixed number of days, a day not a fixed number of hours across a clock change).
+ */
+public struct Interval
+{
+    public int32 $months = 0;
+    public int32 $days = 0;
+    public int64 $micros = 0;
+
+    /**
+     * The `postgres` interval style, which is the server's default:
+     * `1 year 2 mons 3 days 04:05:06.5`. Null for anything else.
+     */
+    public static function parse(const string& $text) : Interval?
+    {
+        int64 $months = 0;
+        int64 $days = 0;
+        int64 $micros = 0;
+        array<string> $words = str::split($text, ' ')->owned();
+        usize $i = 0;
+        while ($i < $words->count()) {
+            string $w = $words[$i];
+            if ($w->contains(':')) {
+                bool $neg = $w->starts('-');
+                string $clock = $w;
+                if ($neg || $w->starts('+')) {
+                    $clock = $w->sub(1, $w->size() - 1);
+                }
+                // hours may run past 24 and past two digits
+                usize $colon = $clock->find(':');
+                uint32 $h = guard digits($clock, 0, $colon) else {
+                    return null;
+                }
+                string $hms = '00';
+                $hms->append($clock->sub($colon, $clock->size() - $colon));
+                Time $t = guard Time::parse($hms) else {
+                    return null;
+                }
+                int64 $span = ($h as int64) * 3600000000 + $t->micros();
+                if ($neg) {
+                    $span = 0 - $span;
+                }
+                $micros = $micros + $span;
+                $i = $i + 1;
+                continue;
+            }
+            if ($i + 1 >= $words->count()) {
+                return null;
+            }
+            int64 $n = guard str::int($w) else {
+                return null;
+            }
+            string $unit = $words[$i + 1];
+            if ($unit == 'year' || $unit == 'years') {
+                $months = $months + $n * 12;
+            } else if ($unit == 'mon' || $unit == 'mons') {
+                $months = $months + $n;
+            } else if ($unit == 'day' || $unit == 'days') {
+                $days = $days + $n;
+            } else {
+                return null;
+            }
+            $i = $i + 2;
+        }
+        Interval? $out = Interval($months as int32, $days as int32, $micros);
+        return $out;
+    }
+}
+
+/**
+ * A UUID: its 16 bytes.
+ */
+public struct Uuid
+{
+    public const string $bytes;
+
+    /**
+     * `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`, with or without the hyphens, either case. Null
+     * when `$text` is not one.
+     */
+    public static function parse(const string& $text) : Uuid?
+    {
+        string $hex = str::replace($text, '-', '');
+        if ($hex->size() != 32) {
+            return null;
+        }
+        string $raw = guard crypto::unhex($hex) else {
+            return null;
+        }
+        Uuid? $out = Uuid($raw);
+        return $out;
+    }
+}
+
+/**
+ * The decimal digits of `$text` from `$at` for `$n` bytes, or null when one is not a digit.
+ */
+internal function digits(const string& $text, usize $at, usize $n) : uint32?
+{
+    if ($n == 0 || $n > 9 || $at + $n > $text->size()) {
+        return null;
+    }
+    uint32 $v = 0;
+    usize $i = 0;
+    while ($i < $n) {
+        uint8 $b = $text->byte($at + $i);
+        if ($b < 48 || $b > 57) {
+            return null;
+        }
+        $v = $v * 10 + ($b - 48) as uint32;
+        $i = $i + 1;
+    }
+    uint32? $out = $v;
+    return $out;
+}
+
+/**
+ * `.ffffff` at `$at`, one to six digits, as microseconds.
+ */
+internal function fraction(const string& $text, usize $at, usize $n) : uint32?
+{
+    if ($n < 2 || $n > 7 || $text->byte($at) != 46) {
+        return null;
+    }
+    uint32 $f = guard digits($text, $at + 1, $n - 1) else {
+        return null;
+    }
+    usize $pad = $n - 1;
+    while ($pad < 6) {
+        $f = $f * 10;
+        $pad = $pad + 1;
+    }
+    uint32? $out = $f;
+    return $out;
+}
+
+/**
+ * A zone offset as the server writes it (`+01`, `-05:30`, `+05:30:15`, `Z`), in seconds east of
+ * UTC.
+ */
+internal function offsetSeconds(const string& $text) : int64?
+{
+    if ($text == 'Z') {
+        int64? $zero = 0;
+        return $zero;
+    }
+    if ($text->size() < 3) {
+        return null;
+    }
+    uint8 $sign = $text->byte(0);
+    if ($sign != 43 && $sign != 45) {
+        return null;
+    }
+    uint32 $h = guard digits($text, 1, 2) else {
+        return null;
+    }
+    int64 $secs = ($h as int64) * 3600;
+    usize $at = 3;
+    if ($text->size() >= 6 && $text->byte(3) == 58) {
+        uint32 $m = guard digits($text, 4, 2) else {
+            return null;
+        }
+        $secs = $secs + ($m as int64) * 60;
+        $at = 6;
+        if ($text->size() >= 9 && $text->byte(6) == 58) {
+            uint32 $s = guard digits($text, 7, 2) else {
+                return null;
+            }
+            $secs = $secs + ($s as int64);
+            $at = 9;
+        }
+    }
+    if ($at != $text->size()) {
+        return null;
+    }
+    if ($sign == 45) {
+        $secs = 0 - $secs;
+    }
+    int64? $out = $secs;
+    return $out;
+}

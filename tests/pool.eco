@@ -1,0 +1,219 @@
+/**
+ * The pool against a scripted server that takes any number of clients, each on a thread of its
+ * own, and answers the few commands a pool sends: logins, pings, BEGIN, ROLLBACK, small queries.
+ * What the server saw is counted, so a test can tell a reused connection from a new one.
+ */
+
+use std::thread;
+use std::time;
+use pgsql::protocol::{QUERY, SYNC, TERMINATE, COMMAND_COMPLETE};
+
+internal struct Seen
+{
+    internal usize $logins = 0;
+    internal usize $rollbacks = 0;
+    internal usize $quits = 0;
+}
+
+#[atomic]
+internal class Many
+{
+    internal tcp::Listener $l;
+    internal thread::mutex<Seen> $seen;
+
+    internal constructor()
+    {
+        tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+            die("listen: {$e}");
+        }
+        $this->l = $l;
+        $this->seen = thread::mutex<Seen>(Seen());
+    }
+
+    internal function seen() : Seen
+    {
+        thread::locked<Seen> $s = $this->seen->lock();
+        return $s->value;
+    }
+
+    internal const function pool(pgsql::PoolOptions $limits) : pgsql::Pool
+    {
+        pgsql::Options $o = pgsql::Options($user: 'app', $password: 'secret');
+        $o->port = $this->l->local->port;
+        $o->connectTimeout = time::duration::secs(5);
+        return pgsql::Pool($o, $limits);
+    }
+
+    /**
+     * Accept clients until the listener closes, each served on a detached thread.
+     */
+    internal function start() : void
+    {
+        Many $me = $this;
+        thread::handle $h = guard thread::spawn(function() : void {
+            while (true) {
+                result<tcp::Stream?, tcp::Error> $got = $me->l->accept(tcp::Deadline(ms: 200));
+                if ($got->failed()) {
+                    return;
+                }
+                tcp::Stream? $maybe = $got->unwrap();
+                if ($maybe == null) {
+                    continue;
+                }
+                tcp::Stream $s = guard $maybe;
+                thread::handle $one = guard thread::spawn(function() : void {
+                    $me->serve(Wire($s, $me->l));
+                }) else ($e) {
+                    die($e->message());
+                }
+                $one->detach();
+            }
+        }) else ($e) {
+            die($e->message());
+        }
+        $h->detach();
+    }
+
+    internal function serve(Wire $w) : void
+    {
+        $w->welcome();
+        {
+            thread::locked<Seen> $s = $this->seen->lock();
+            $s->value->logins = $s->value->logins + 1;
+        }
+        uint8 $status = 73;
+        while (true) {
+            Msg $m = guard $w->tryRecv(10000) else {
+                return;
+            }
+            if ($m->type == TERMINATE) {
+                thread::locked<Seen> $s = $this->seen->lock();
+                $s->value->quits = $s->value->quits + 1;
+                return;
+            }
+            if ($m->type == SYNC) {
+                $w->ready($status);
+                continue;
+            }
+            if ($m->type == QUERY) {
+                if ($m->body->starts('BEGIN')) {
+                    $status = 84;
+                    $w->send(COMMAND_COMPLETE, commandComplete('BEGIN'));
+                } else if ($m->body->starts('ROLLBACK')) {
+                    $status = 73;
+                    {
+                        thread::locked<Seen> $s = $this->seen->lock();
+                        $s->value->rollbacks = $s->value->rollbacks + 1;
+                    }
+                    $w->send(COMMAND_COMPLETE, commandComplete('ROLLBACK'));
+                } else if ($m->body->starts('COMMIT')) {
+                    $status = 73;
+                    $w->send(COMMAND_COMPLETE, commandComplete('COMMIT'));
+                } else if ($m->body->starts('FAIL')) {
+                    $w->error('22012', 'division by zero');
+                    if ($status == 84) {
+                        $status = 69;
+                    }
+                } else {
+                    $w->send(COMMAND_COMPLETE, commandComplete('UPDATE 1'));
+                }
+                $w->ready($status);
+            }
+        }
+    }
+}
+
+internal function limits(usize $max, int64 $acquireMs) : pgsql::PoolOptions
+{
+    pgsql::PoolOptions $p = pgsql::PoolOptions();
+    $p->max = $max;
+    $p->acquireTimeout = time::duration::millis($acquireMs);
+    return $p;
+}
+
+test the_pool_reuses_an_idle_connection
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::Pool $p = $m->pool(limits(2, 2000));
+    did($p->exec('UPDATE t SET a = 1'));
+    did($p->exec('UPDATE t SET a = 2'));
+    assert($m->seen()->logins == 1);
+    assert($p->open() == 1);
+    assert($p->idle() == 1);
+    $p->close();
+    thread::sleep(100);
+    assert($m->seen()->quits == 1);
+    $m->l->close();
+}
+
+test a_full_pool_makes_the_next_borrower_wait_then_gives_up
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::Pool $p = $m->pool(limits(1, 300));
+    pgsql::Lease $held = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    time::instant $t = time::instant::now();
+    assert($p->acquire()->failure()->name() == 'exhausted');
+    assert($t->elapsed()->as_millis() >= 250);
+    // a waiter gets the connection given back
+    pgsql::Pool $shared = $p;
+    thread::handle $h = guard thread::spawn(function() : void {
+        thread::sleep(100);
+        $held->release();
+    }) else ($e) {
+        die($e->message());
+    }
+    pgsql::Lease $next = guard $shared->acquire(by: tcp::Deadline(ms: 3000)) else ($e) {
+        die("{$e}");
+    }
+    $h->join();
+    assert($m->seen()->logins == 1);
+    $next->release();
+    $p->close();
+    $m->l->close();
+}
+
+test a_lease_given_back_in_a_transaction_is_rolled_back
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::Pool $p = $m->pool(limits(1, 2000));
+    {
+        pgsql::Lease $l = guard $p->acquire() else ($e) {
+            die("{$e}");
+        }
+        did($l->db()->exec('BEGIN'));
+        assert(failsExec($l->db()->exec('FAIL'))->is(.divisionByZero));
+        assert($l->db()->inTransaction());
+    }
+    assert($m->seen()->rollbacks == 1);
+    pgsql::Lease $again = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    assert(!$again->db()->inTransaction());
+    $again->release();
+    // a transaction through the pool commits, and rolls back on error
+    status<pgsql::Error> $t = $p->transaction(function(pgsql::Connection $c) : status<pgsql::Error> {
+        guard $c->exec('FAIL') else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    });
+    assert($t->failure()->is(.divisionByZero));
+    assert($m->seen()->rollbacks == 2);
+    $p->close();
+    $m->l->close();
+}
+
+test a_closed_pool_lends_nothing
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::Pool $p = $m->pool(limits(2, 500));
+    $p->close();
+    assert($p->acquire()->failure()->name() == 'closed');
+    $m->l->close();
+}

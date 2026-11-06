@@ -1,0 +1,87 @@
+namespace pgsql;
+
+/**
+ * An open transaction. `commit()` makes it stick. Dropping it without a commit rolls it back, so a
+ * function that leaves early by `guard ... else { return ... }` cannot leave one half done.
+ */
+public class Transaction
+{
+    private Connection $db;
+    private bool $open;
+
+    internal constructor(Connection $db)
+    {
+        $this->db = $db;
+        $this->open = true;
+    }
+
+    destructor()
+    {
+        if ($this->open) {
+            status<Error> $undone = $this->rollback();
+        }
+    }
+
+    /**
+     * Make the work stick. Fails if this transaction is already finished, and when an earlier
+     * statement failed: the server rolls a failed transaction back on COMMIT, so that is reported
+     * as `.inFailedSqlTransaction`.
+     */
+    public function commit(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        if (!$this->open) {
+            return .error(.invalid('the transaction is already finished'));
+        }
+        bool $failed = $this->db->status == pgsql::protocol::FAILED;
+        Outcome $o = guard $this->db->exec('COMMIT', by: $by) else ($e) {
+            $this->settled($e);
+            return .error($e);
+        }
+        $this->open = false;
+        // COMMIT of a failed transaction answers ROLLBACK
+        if ($failed || $o->command == 'ROLLBACK') {
+            return .error(.server(ServerError(ErrorCode::inFailedSqlTransaction, 'ERROR', '25P02', 'the transaction failed earlier and was rolled back')));
+        }
+        return .ok;
+    }
+
+    /**
+     * Undo the work. Safe to call twice.
+     */
+    public function rollback(by: tcp::Deadline? $by = null) : status<Error>
+    {
+        if (!$this->open) {
+            return .ok;
+        }
+        if (!$this->db->alive()) {
+            $this->open = false;
+            return .error(.closed);
+        }
+        guard $this->db->exec('ROLLBACK', by: $by) else ($e) {
+            $this->settled($e);
+            return .error($e);
+        }
+        $this->open = false;
+        return .ok;
+    }
+
+    /**
+     * After a COMMIT or ROLLBACK that failed: still open only when it never left this side (the
+     * connection was busy), so dropping this rolls it back later.
+     */
+    private function settled(const Error& $e) : void
+    {
+        $this->open = match ($e) {
+            Error::busy => true,
+            else => false,
+        };
+    }
+
+    /**
+     * True until `commit` or `rollback` (or a drop) finishes this transaction.
+     */
+    public const function open() : bool
+    {
+        return $this->open;
+    }
+}

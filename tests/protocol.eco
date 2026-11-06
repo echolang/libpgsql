@@ -1,0 +1,202 @@
+/**
+ * The messages byte for byte: what the builders write, and what the parsers make of a body, a
+ * short one included.
+ */
+
+namespace pgsql::protocol;
+
+internal function unhexed(const string& $hex) : string
+{
+    string $s = guard crypto::unhex($hex) else {
+        die("bad hex in a test: {$hex}");
+    }
+    return $s;
+}
+
+internal function bytes(const array<uint8>& $b) : string
+{
+    string $s = '';
+    foreach ($b as $x) {
+        $s->push($x);
+    }
+    return $s;
+}
+
+test startup_message_bytes
+{
+    string $out = '';
+    ordered_map<string, string> $p = ordered_map<string, string>();
+    $p['user'] = 'u';
+    startup($out, PROTOCOL_3_0, $p);
+    assert($out == bytes([0, 0, 0, 16, 0, 3, 0, 0, 117, 115, 101, 114, 0, 117, 0, 0]));
+}
+
+test simple_messages_bytes
+{
+    string $out = '';
+    sync($out);
+    flush($out);
+    terminate($out);
+    copyDone($out);
+    assert($out == bytes([83, 0, 0, 0, 4, 72, 0, 0, 0, 4, 88, 0, 0, 0, 4, 99, 0, 0, 0, 4]));
+
+    string $q = '';
+    query($q, 'SELECT 1');
+    assert($q == "Q\0\0\0\x0dSELECT 1\0");
+
+    string $pw = '';
+    password($pw, 'pw');
+    assert($pw == "p\0\0\0\x07pw\0");
+}
+
+test sasl_messages_bytes
+{
+    string $out = '';
+    saslInitial($out, 'M', 'xy');
+    assert($out == "p\0\0\0\x0cM\0\0\0\0\x02xy");
+    string $r = '';
+    saslResponse($r, 'abc');
+    assert($r == "p\0\0\0\x07abc");
+}
+
+test extended_query_messages_bytes
+{
+    string $p = '';
+    array<uint32> $types = [23];
+    parse($p, 's1', 'SELECT $1', $types);
+    assert($p == "P\0\0\0\x17s1\0SELECT $1\0\0\x01\0\0\0\x17");
+
+    string $b = '';
+    string $values = '';
+    tcp::wire::putBe32($values, 4294967295);
+    tcp::wire::putBe32($values, 1);
+    $values->push(55);
+    array<int16> $pf = [1];
+    array<int16> $rf = array<int16>();
+    bind($b, '', 's1', $pf, 2, $values, $rf);
+    assert($b == unhexed('420000001900733100000100010002ffffffff00000001370000'));
+
+    string $d = '';
+    describe($d, STATEMENT, 's1');
+    execute($d, '', 0);
+    close($d, PORTAL, '');
+    assert($d == "D\0\0\0\x08Ss1\0E\0\0\0\x09\0\0\0\0\0C\0\0\0\x06P\0");
+}
+
+test copy_and_cancel_messages_bytes
+{
+    string $out = '';
+    copyData($out, 'ab');
+    copyFail($out, 'no');
+    assert($out == "d\0\0\0\x06abf\0\0\0\x07no\0");
+    string $c = cancelRequest(258, 'wxyz');
+    assert($c == unhexed('0000001004d2162e000001027778797a'));
+}
+
+test backend_parsers
+{
+    AuthRequest $a = authRequest("\0\0\0\x05salt")->unwrap();
+    assert($a->code == AUTH_MD5);
+    assert($a->data == 'salt');
+    assert(authRequest("\0\0")->failed());
+
+    array<string> $m = mechanisms("SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0")->unwrap();
+    assert($m->count() == 2);
+    assert($m[1] == 'SCRAM-SHA-256');
+    assert(mechanisms("SCRAM")->failed());
+
+    pgsql::CancelKey $k = backendKey("\0\0\x01\x02abcd")->unwrap();
+    assert($k->pid == 258);
+    assert(backendKey("\0\0\x01\x02ab")->failed());
+    assert(backendKey("\0\0")->failed());
+
+    Setting $s = parameterStatus("TimeZone\0UTC\0")->unwrap();
+    assert($s->name == 'TimeZone');
+    assert($s->value == 'UTC');
+    assert(parameterStatus("TimeZone\0UTC")->failed());
+
+    uint8 $idle = readyStatus('I')->unwrap();
+    uint8 $failed = readyStatus('E')->unwrap();
+    assert($idle == IDLE);
+    assert($failed == FAILED);
+    assert(readyStatus('X')->failed());
+    assert(readyStatus('II')->failed());
+
+    Negotiated $n = negotiated("\0\0\0\0\0\0\0\x01_pq_.x\0")->unwrap();
+    assert($n->minor == 0);
+    assert($n->unknown[0] == '_pq_.x');
+    assert(negotiated("\0\0\0\0\0\0\0\x09")->failed());
+
+    CopyFormat $cf = copyFormat("\0\0\x02\0\0\0\x01")->unwrap();
+    assert($cf->format == 0);
+    assert($cf->columns[1] == 1);
+    assert(copyFormat("\0\0\x05\0\0")->failed());
+}
+
+test command_complete_counts
+{
+    assert(complete("INSERT 0 5\0")->unwrap()->affectedRows == 5);
+    assert(complete("INSERT 0 5\0")->unwrap()->command == 'INSERT');
+    assert(complete("UPDATE 3\0")->unwrap()->affectedRows == 3);
+    assert(complete("SELECT 10\0")->unwrap()->affectedRows == 10);
+    assert(complete("COPY 7\0")->unwrap()->affectedRows == 7);
+    assert(complete("CREATE TABLE\0")->unwrap()->affectedRows == 0);
+    assert(complete("BEGIN\0")->unwrap()->command == 'BEGIN');
+    assert(complete("BEGIN")->failed());
+}
+
+test error_fields
+{
+    string $b = '';
+    array<string> $fields = ['SERROR', 'VERROR', 'C23505', 'Mduplicate key', 'DKey (id)=(1) exists.', 'Hdrop it', 'P12', 'Wfn', 'spublic', 'titems', 'cid', 'dint4', 'nitems_pkey', 'Rroutine', 'Xunknown'];
+    foreach ($fields as $f) {
+        $b->append($f);
+        $b->push(0);
+    }
+    $b->push(0);
+    pgsql::ServerError $e = serverError($b);
+    assert($e->code == pgsql::ErrorCode::uniqueViolation);
+    assert($e->severity == 'ERROR');
+    assert($e->message == 'duplicate key');
+    assert($e->detail == 'Key (id)=(1) exists.');
+    assert($e->hint == 'drop it');
+    assert($e->position == 12);
+    assert($e->where == 'fn');
+    assert($e->schema == 'public');
+    assert($e->table == 'items');
+    assert($e->column == 'id');
+    assert($e->dataType == 'int4');
+    assert($e->constraint == 'items_pkey');
+    assert($e->routine == 'routine');
+
+    // a broken body still makes an error; an unknown state is XX000
+    pgsql::ServerError $short = serverError("Mhalf");
+    assert($short->state == 'XX000');
+    assert($short->code == pgsql::ErrorCode::internalError);
+}
+
+test sqlstate_numbers_name_their_codes
+{
+    assert(pgsql::ErrorCode::from(pgsql::sqlstate('40P01')) == pgsql::ErrorCode::deadlockDetected);
+    assert(pgsql::ErrorCode::from(pgsql::sqlstate('P0001')) == pgsql::ErrorCode::raiseException);
+    assert(pgsql::ErrorCode::from(pgsql::sqlstate('XX000')) == pgsql::ErrorCode::internalError);
+    pgsql::ErrorCode $other = pgsql::ErrorCode::from(pgsql::sqlstate('HV000'));
+    assert($other->value() == pgsql::sqlstate('HV000'));
+}
+
+test cursor_refuses_to_read_past_the_end
+{
+    Cursor $c = Cursor("\x01\x02\x03");
+    assert($c->u16()->or(0) == 258);
+    assert($c->u16()->failed());
+    assert($c->i32()->failed());
+    assert($c->u8()->or(0) == 3);
+    assert($c->u8()->failed());
+    assert($c->done());
+    Cursor $s = Cursor("ab\0cd");
+    assert($s->cstring()->unwrap() == 'ab');
+    assert($s->cstring()->failed());
+    string $neg = unhexed('fffffffffffffffe');
+    Cursor $n = Cursor($neg);
+    assert($n->i64()->or(0) == -2);
+}

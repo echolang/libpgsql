@@ -1,0 +1,234 @@
+/**
+ * Named placeholders: `:name` rewritten to `$1`, `$2`, ... in one pass that leaves quoted text,
+ * identifiers, dollar-quoted bodies and comments alone. A name used twice is the same parameter.
+ * Native `$1` placeholders pass through, and the two styles do not mix. There is no `?`: in
+ * PostgreSQL it is a JSONB operator. After an identifier or a number a colon is an array slice
+ * (`a[1:n]`); a slice without its lower bound (`a[:n]`) reads as a placeholder, so write the bound.
+ */
+
+namespace pgsql::protocol;
+
+/**
+ * The SQL as the server gets it, the placeholder names in parameter order (empty for `$n` or no
+ * placeholders), and how many parameters the SQL takes.
+ */
+internal struct Placeholders
+{
+    internal string $sql;
+    internal array<string> $names;
+    internal usize $count;
+}
+
+// PostgreSQL takes at most this many parameters in one statement
+internal const usize MAX_PARAMS = 65535;
+
+internal function identStart(uint8 $c) : bool
+{
+    return ($c >= 97 && $c <= 122) || ($c >= 65 && $c <= 90) || $c == 95 || $c >= 128;
+}
+
+internal function identPart(uint8 $c) : bool
+{
+    return identStart($c) || ($c >= 48 && $c <= 57) || $c == 36;
+}
+
+/**
+ * Where the quoted text starting at `$at` ends: just past the closing `$q`, a doubled one being
+ * part of the text. With `$escapes` (an E'' string) a backslash escapes the next byte. An
+ * unterminated quote runs to the end.
+ */
+internal function quoted(const string& $sql, usize $at, uint8 $q, bool $escapes) : usize
+{
+    usize $n = $sql->size();
+    usize $i = $at + 1;
+    while ($i < $n) {
+        uint8 $c = $sql->byte($i);
+        if ($escapes && $c == 92) {
+            $i = $i + 2;
+            continue;
+        }
+        if ($c == $q) {
+            if ($i + 1 < $n && $sql->byte($i + 1) == $q) {
+                $i = $i + 2;
+                continue;
+            }
+            return $i + 1;
+        }
+        $i = $i + 1;
+    }
+    return $n;
+}
+
+/**
+ * The end of a dollar-quoted body starting at `$at` (`$$...$$` or `$tag$...$tag$`), or null when
+ * no dollar quote starts there.
+ */
+internal function dollarQuoted(const string& $sql, usize $at) : usize?
+{
+    usize $n = $sql->size();
+    usize $i = $at + 1;
+    while ($i < $n && $sql->byte($i) != 36) {
+        uint8 $c = $sql->byte($i);
+        if (!identPart($c) || $c == 36 || ($i == $at + 1 && !identStart($c))) {
+            return null;
+        }
+        $i = $i + 1;
+    }
+    if ($i >= $n) {
+        return null;
+    }
+    string $tag = $sql->sub($at, $i + 1 - $at);
+    usize $close = $sql->find($tag, $i + 1);
+    if ($close == $n) {
+        usize? $open = $n;
+        return $open;
+    }
+    usize? $end = $close + $tag->size();
+    return $end;
+}
+
+/**
+ * The end of a block comment starting at `$at`, past its closing star and slash. Block comments
+ * nest in PostgreSQL.
+ */
+internal function blockComment(const string& $sql, usize $at) : usize
+{
+    usize $n = $sql->size();
+    usize $depth = 1;
+    usize $i = $at + 2;
+    while ($i < $n) {
+        if ($i + 1 < $n && $sql->byte($i) == 47 && $sql->byte($i + 1) == 42) {
+            $depth = $depth + 1;
+            $i = $i + 2;
+            continue;
+        }
+        if ($i + 1 < $n && $sql->byte($i) == 42 && $sql->byte($i + 1) == 47) {
+            $depth = $depth - 1;
+            $i = $i + 2;
+            if ($depth == 0) {
+                return $i;
+            }
+            continue;
+        }
+        $i = $i + 1;
+    }
+    return $n;
+}
+
+internal function placeholders(const string& $sql) : result<Placeholders, pgsql::Error>
+{
+    usize $n = $sql->size();
+    string $out = '';
+    $out->reserve($n + 8);
+    array<string> $names = array<string>();
+    usize $native = 0;
+    usize $i = 0;
+    while ($i < $n) {
+        uint8 $c = $sql->byte($i);
+        uint8 $prev = 0;
+        if ($i > 0) {
+            $prev = $sql->byte($i - 1);
+        }
+        if ($c == 39) {
+            // E'...' takes backslash escapes; the E is already copied
+            bool $escapes = ($prev == 69 || $prev == 101) && ($i < 2 || !identPart($sql->byte($i - 2)));
+            usize $end = quoted($sql, $i, 39, $escapes);
+            $out->append($sql->sub($i, $end - $i));
+            $i = $end;
+            continue;
+        }
+        if ($c == 34) {
+            usize $endq = quoted($sql, $i, 34, false);
+            $out->append($sql->sub($i, $endq - $i));
+            $i = $endq;
+            continue;
+        }
+        if ($c == 45 && $i + 1 < $n && $sql->byte($i + 1) == 45) {
+            usize $nl = $sql->find("\n", $i);
+            $out->append($sql->sub($i, $nl - $i));
+            $i = $nl;
+            continue;
+        }
+        if ($c == 47 && $i + 1 < $n && $sql->byte($i + 1) == 42) {
+            usize $endc = blockComment($sql, $i);
+            $out->append($sql->sub($i, $endc - $i));
+            $i = $endc;
+            continue;
+        }
+        if ($c == 36 && !identPart($prev)) {
+            if ($i + 1 < $n && $sql->byte($i + 1) >= 48 && $sql->byte($i + 1) <= 57) {
+                // a native $n
+                usize $j = $i + 1;
+                usize $num = 0;
+                while ($j < $n && $sql->byte($j) >= 48 && $sql->byte($j) <= 57) {
+                    $num = $num * 10 + ($sql->byte($j) - 48) as usize;
+                    if ($num > MAX_PARAMS) {
+                        return .error(.invalid('a placeholder number over the 65535 PostgreSQL allows'));
+                    }
+                    $j = $j + 1;
+                }
+                if ($num == 0) {
+                    return .error(.invalid('placeholders count from $1'));
+                }
+                if ($num > $native) {
+                    $native = $num;
+                }
+                $out->append($sql->sub($i, $j - $i));
+                $i = $j;
+                continue;
+            }
+            usize? $dq = dollarQuoted($sql, $i);
+            if ($dq != null) {
+                usize $endd = guard $dq;
+                $out->append($sql->sub($i, $endd - $i));
+                $i = $endd;
+                continue;
+            }
+        }
+        if ($c == 58) {
+            if ($i + 1 < $n && $sql->byte($i + 1) == 58) {
+                // a :: cast
+                $out->append('::');
+                $i = $i + 2;
+                continue;
+            }
+            // after an identifier or a number it is an array slice, `a[1:n]`, not a placeholder
+            if ($i + 1 < $n && identStart($sql->byte($i + 1)) && !identPart($prev)) {
+                usize $j = $i + 1;
+                while ($j < $n && identPart($sql->byte($j)) && $sql->byte($j) != 36) {
+                    $j = $j + 1;
+                }
+                string $name = $sql->sub($i + 1, $j - $i - 1);
+                usize $index = $names->count();
+                usize $k = 0;
+                while ($k < $names->count()) {
+                    if ($names[$k] == $name) {
+                        $index = $k;
+                        break;
+                    }
+                    $k = $k + 1;
+                }
+                if ($index == $names->count()) {
+                    $names->push($name);
+                }
+                $out->push(36);
+                $out->append(str::from($index + 1));
+                $i = $j;
+                continue;
+            }
+        }
+        $out->push($c);
+        $i = $i + 1;
+    }
+    if ($native > 0 && !$names->empty()) {
+        return .error(.invalid('the SQL mixes $n and :name placeholders: use one or the other'));
+    }
+    if ($names->count() > MAX_PARAMS) {
+        return .error(.invalid('more placeholders than the 65535 PostgreSQL allows'));
+    }
+    usize $count = $names->count();
+    if ($native > 0) {
+        $count = $native;
+    }
+    return .ok(Placeholders($out, $names, $count));
+}

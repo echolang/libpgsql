@@ -1,0 +1,386 @@
+namespace pgsql;
+
+use pgsql::protocol::Message;
+
+// copy data gathers up to this much before it goes out
+internal const usize COPY_CHUNK = 65536;
+
+/**
+ * A `COPY ... FROM STDIN` in progress: data goes out with `write` (as it is) or `row` (one row,
+ * encoded for the COPY's format), `finish()` ends it and reports how many rows the server took.
+ * The connection is busy until then. Dropped unfinished, the COPY is abandoned and nothing is
+ * copied.
+ *
+ * ```echo
+ * pgsql::CopyIn $c = guard $db->copyIn('COPY items (name, price) FROM STDIN');
+ * guard $c->row(['Desk', .numeric('120')]);
+ * pgsql::Outcome $o = guard $c->finish();
+ * echo $o->affectedRows;      // 1
+ * ```
+ */
+public class CopyIn
+{
+    private Connection $db;
+    private tcp::Deadline $by;
+    private bool $open;
+    // rows encoded and not yet wrapped in a CopyData message
+    private string $pending;
+    // the column types of a binary COPY that `row` encodes for; empty for text
+    private array<uint32> $types;
+
+    /**
+     * True when the COPY runs in its binary format.
+     */
+    public const bool $binary;
+
+    internal constructor(Connection $db, tcp::Deadline $by, bool $binary, array<uint32> $types)
+    {
+        $this->db = $db;
+        $this->by = $by;
+        $this->open = true;
+        $this->binary = $binary;
+        $this->types = $types;
+        $this->pending = '';
+        $this->pending->reserve(COPY_CHUNK + 1024);
+        $db->busy = true;
+        if (!$types->empty()) {
+            // the binary format's header: signature, flags, no extension
+            $this->pending->append('PGCOPY');
+            $this->pending->push(10);
+            $this->pending->push(255);
+            $this->pending->push(13);
+            $this->pending->push(10);
+            $this->pending->push(0);
+            tcp::wire::putBe32($this->pending, 0);
+            tcp::wire::putBe32($this->pending, 0);
+        }
+    }
+
+    destructor()
+    {
+        if ($this->open) {
+            status<Error> $dropped = $this->abort('the CopyIn was dropped before finish()');
+        }
+    }
+
+    /**
+     * Send `$data` as it is: rows in the format the COPY names, split anywhere.
+     */
+    public function write(string::view $data) : status<Error>
+    {
+        if (!$this->open) {
+            return .error(.invalid('the COPY is already finished'));
+        }
+        $this->wrap();
+        pgsql::protocol::copyData($this->db->channel->out, $data);
+        return $this->flushed(false);
+    }
+
+    /**
+     * Send one row: in the text format (values as their text, tab-separated, NULL as `\N`,
+     * escapes where needed) or, for a COPY started with its table and columns, in the binary
+     * format for those columns' types.
+     */
+    public function row(const array<Value>& $values) : status<Error>
+    {
+        if (!$this->open) {
+            return .error(.invalid('the COPY is already finished'));
+        }
+        if (!$this->types->empty()) {
+            if ($values->count() != $this->types->count()) {
+                return .error(.invalid("a row of {$values->count()} values for {$this->types->count()} columns"));
+            }
+            usize $mark = $this->pending->size();
+            tcp::wire::putBe16($this->pending, $values->count() as uint16);
+            foreach ($values as $i => const &$v) {
+                if ($v->isNull()) {
+                    tcp::wire::putBe32($this->pending, pgsql::protocol::NULL_AT);
+                    continue;
+                }
+                uint32 $oid = $this->types[$i];
+                bool $done = guard pgsql::protocol::binaryOf($v, pgsql::protocol::shape($oid), $oid, $this->pending) else ($e) {
+                    // the row's fields so far go, so the next row starts clean
+                    $this->pending = $this->pending->sub(0, $mark);
+                    return .error($e);
+                }
+                if (!$done) {
+                    $this->pending = $this->pending->sub(0, $mark);
+                    return .error(.invalid("a {$v->kind()} value for column {$i}, whose type has no binary form here"));
+                }
+            }
+        } else if ($this->binary) {
+            return .error(.invalid('row() writes binary rows only for a COPY started with its table and columns: write() the bytes'));
+        } else {
+            copyLine($values, $this->pending);
+        }
+        if ($this->pending->size() >= COPY_CHUNK) {
+            $this->wrap();
+            return $this->flushed(false);
+        }
+        return .ok;
+    }
+
+    /**
+     * End the COPY. What the server reports: the rows it copied. An error for any row fails the
+     * whole COPY, and nothing is copied.
+     */
+    public function finish() : result<Outcome, Error>
+    {
+        if (!$this->open) {
+            return .error(.invalid('the COPY is already finished'));
+        }
+        if (!$this->types->empty()) {
+            tcp::wire::putBe16($this->pending, 65535);
+        }
+        $this->wrap();
+        $this->stop();
+        pgsql::protocol::copyDone($this->db->channel->out);
+        guard $this->flushed(true) else ($e) {
+            return .error($e);
+        }
+        Head $h = guard $this->db->head(null, $this->by) else ($e) {
+            return .error($e);
+        }
+        guard $this->db->drain($this->by) else ($e) {
+            return .error($e);
+        }
+        match ($h) {
+            Head::done($o) => {
+                return .ok($o->settled($this->db->status));
+            },
+            else => {
+                return .error(.malformed('a COPY that ended without its row count'));
+            },
+        }
+    }
+
+    /**
+     * Abandon the COPY: nothing is copied. The server's answer, the error that says so, is
+     * expected and not reported.
+     */
+    public function abort(const string& $reason) : status<Error>
+    {
+        if (!$this->open) {
+            return .ok;
+        }
+        $this->stop();
+        $this->pending->clear();
+        pgsql::protocol::copyFail($this->db->channel->out, $reason);
+        guard $this->flushed(true) else ($e) {
+            return .error($e);
+        }
+        result<Head, Error> $h = $this->db->head(null, $this->by);
+        if ($h->failed()) {
+            Error $e = $h->failure();
+            if ($e->is(.queryCanceled)) {
+                return .ok;
+            }
+            return .error($e);
+        }
+        return $this->db->drain($this->by);
+    }
+
+    /**
+     * The rows encoded so far, as one CopyData message.
+     */
+    private function wrap() : void
+    {
+        if ($this->pending->empty()) {
+            return;
+        }
+        pgsql::protocol::copyData($this->db->channel->out, $this->pending);
+        $this->pending->clear();
+    }
+
+    /**
+     * Send what gathered once there is enough of it, or now with `$all`. The server says nothing
+     * back until the end.
+     */
+    private function flushed(bool $all) : status<Error>
+    {
+        if (!$all && $this->db->channel->out->size() < COPY_CHUNK) {
+            return .ok;
+        }
+        guard $this->db->channel->send($this->by) else ($e) {
+            $this->stop();
+            $this->db->abandon($e);
+            return .error($e);
+        }
+        return .ok;
+    }
+
+    private function stop() : void
+    {
+        $this->open = false;
+        $this->db->busy = false;
+    }
+}
+
+/**
+ * One row in COPY's text format, newline included.
+ */
+internal function copyLine(const array<Value>& $values, string& $out) : void
+{
+    bool $first = true;
+    foreach ($values as const &$v) {
+        if (!$first) {
+            $out->push(9);
+        }
+        $first = false;
+        match ($v) {
+            Value::none => {
+                $out->append('\\N');
+            },
+            Value::int($n) => {
+                pgsql::protocol::putInt($out, $n);
+            },
+            Value::float($f) => {
+                $out->append(pgsql::protocol::floatWire($f));
+            },
+            Value::text($t) => {
+                copyEscaped($t, $out);
+            },
+            else => {
+                copyEscaped(pgsql::protocol::wireText($v), $out);
+            },
+        }
+    }
+    $out->push(10);
+}
+
+/**
+ * `$t` with COPY's text escapes: backslash, tab, newline and carriage return. Runs without one are
+ * appended whole.
+ */
+internal function copyEscaped(const string& $t, string& $out) : void
+{
+    usize $n = $t->size();
+    usize $from = 0;
+    usize $i = 0;
+    while ($i < $n) {
+        uint8 $c = $t->byte($i);
+        if ($c == 92 || $c == 9 || $c == 10 || $c == 13) {
+            if ($i > $from) {
+                string::view $run = $t->view()->sub($from, $i - $from);
+                $out->append($run->bytes, $run->size);
+            }
+            $out->push(92);
+            if ($c == 92) {
+                $out->push(92);
+            } else if ($c == 9) {
+                $out->push(116);
+            } else if ($c == 10) {
+                $out->push(110);
+            } else {
+                $out->push(114);
+            }
+            $from = $i + 1;
+        }
+        $i = $i + 1;
+    }
+    if ($from == 0) {
+        $out->append($t);
+    } else if ($from < $n) {
+        string::view $tail = $t->view()->sub($from, $n - $from);
+        $out->append($tail->bytes, $tail->size);
+    }
+}
+
+/**
+ * A `COPY ... TO STDOUT` in progress: `next()` hands out each chunk the server sends (one row per
+ * chunk, as PostgreSQL sends them), until null. The connection is busy until then.
+ *
+ * ```echo
+ * pgsql::CopyOut $c = guard $db->copyOut('COPY items TO STDOUT');
+ * while (true) {
+ *     string::view? $line = guard $c->next();
+ *     ...
+ * }
+ * ```
+ */
+public class CopyOut
+{
+    private Connection $db;
+    private tcp::Deadline $by;
+    private bool $open;
+
+    /**
+     * True when the data is in COPY's binary format.
+     */
+    public const bool $binary;
+
+    internal constructor(Connection $db, tcp::Deadline $by, bool $binary)
+    {
+        $this->db = $db;
+        $this->by = $by;
+        $this->open = true;
+        $this->binary = $binary;
+        $db->busy = true;
+    }
+
+    destructor()
+    {
+        status<Error> $done = $this->finish();
+    }
+
+    /**
+     * The next chunk, in place until the next call, or null at the end. Then `outcome()` has the
+     * row count.
+     */
+    public function next() : result<string::view?, Error>
+    {
+        string::view? $none = null;
+        if (!$this->open) {
+            return .ok($none);
+        }
+        while (true) {
+            Message $m = guard $this->db->channel->next($this->by) else ($e) {
+                $this->stop();
+                return .error($this->db->interrupted($e));
+            }
+            if ($m->type == pgsql::protocol::COPY_DATA) {
+                string::view? $chunk = $m->body;
+                return .ok($chunk);
+            }
+            if ($m->type == pgsql::protocol::COPY_DONE) {
+                $this->stop();
+                guard $this->db->drain($this->by) else ($e) {
+                    return .error($e);
+                }
+                return .ok($none);
+            }
+            $this->stop();
+            if ($m->type == pgsql::protocol::ERROR) {
+                return .error($this->db->refused($m, $this->by));
+            }
+            return .error($this->db->broken(.malformed("message {$m->type} in a COPY's data")));
+        }
+    }
+
+    /**
+     * How the COPY ended: the rows it sent. Read it once `next()` answered null.
+     */
+    public const function outcome() : Outcome
+    {
+        return $this->db->ending;
+    }
+
+    /**
+     * Read and drop whatever is left, so the connection is free.
+     */
+    public function finish() : status<Error>
+    {
+        while ($this->open) {
+            string::view? $chunk = guard $this->next() else ($e) {
+                return .error($e);
+            }
+        }
+        return .ok;
+    }
+
+    private function stop() : void
+    {
+        $this->open = false;
+        $this->db->busy = false;
+    }
+}

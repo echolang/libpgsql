@@ -1,0 +1,224 @@
+namespace pgsql;
+
+use pgsql::protocol::Placeholders;
+
+internal struct Entry
+{
+    internal string $sql;
+    internal Params $params;
+}
+
+/**
+ * Statements sent together and answered together: one round trip for all of them (two when some
+ * SQL is new to the connection, which is prepared first in one more). They run in order as one
+ * implicit transaction: when one fails, the ones before it are rolled back and the ones after it
+ * never run. Inside an explicit transaction they are part of that one instead.
+ *
+ * ```echo
+ * pgsql::Pipeline $p = $db->pipeline();
+ * foreach ($items as const &$i) {
+ *     $p->add('INSERT INTO items (name) VALUES (:name)', ['name' => $i]);
+ * }
+ * array<pgsql::ResultSet> $done = guard $p->run();
+ * ```
+ */
+public class Pipeline
+{
+    private Connection $db;
+    private array<Entry> $entries;
+    private usize? $failed;
+
+    internal constructor(Connection $db)
+    {
+        $this->db = $db;
+        $this->entries = array<Entry>();
+        $this->failed = null;
+    }
+
+    /**
+     * Add `$sql`, run with no values.
+     */
+    public function add(const string& $sql) : Pipeline
+    {
+        $this->entries->push(Entry($sql, Params()));
+        return $this;
+    }
+
+    /**
+     * Add `$sql`, run with `$params`.
+     */
+    public function add(const string& $sql, Params $params) : Pipeline
+    {
+        $this->entries->push(Entry($sql, $params));
+        return $this;
+    }
+
+    /**
+     * How many statements are waiting.
+     */
+    public const function count() : usize
+    {
+        return $this->entries->count();
+    }
+
+    /**
+     * After a failed `run()`, the position of the statement that failed. Null otherwise.
+     */
+    public const function failedAt() : usize?
+    {
+        return $this->failed;
+    }
+
+    /**
+     * Send every statement and read every answer: one `ResultSet` per statement, in order, rows
+     * and outcome. The statements stay, so the same pipeline runs again. A cached statement gone
+     * stale (dropped on the server, or its result changed by a schema change) is prepared again
+     * and the pipeline run once more, outside a transaction.
+     */
+    public function run(by: tcp::Deadline? $by = null) : result<array<ResultSet>, Error>
+    {
+        tcp::Deadline $until = $this->db->deadline($by);
+        result<array<ResultSet>, Error> $done = $this->attempt($until);
+        if ($done->failed() && !$this->db->inTransaction() && stale($done->failure())) {
+            foreach ($this->entries as const &$entry) {
+                $this->db->forget($entry->sql);
+            }
+            return $this->attempt($until);
+        }
+        return $done;
+    }
+
+    private function attempt(tcp::Deadline $until) : result<array<ResultSet>, Error>
+    {
+        $this->failed = null;
+        array<ResultSet> $out = array<ResultSet>();
+        if ($this->entries->empty()) {
+            return .ok($out);
+        }
+        guard $this->db->opening() else ($e) {
+            return .error($e);
+        }
+        bool $named = $this->db->options->statementCache > 0;
+        array<Prepared> $statements = array<Prepared>();
+        array<usize> $which = arr::room<usize>($this->entries->count());
+        if ($named) {
+            guard $this->prepare($statements, $which, $until) else ($e) {
+                return .error($e);
+            }
+        }
+
+        // every Bind and Execute, then one Sync; a value that cannot be bound takes back only what
+        // the binds wrote, not the closes ahead of them
+        Connection $db = $this->db;
+        usize $mark = $db->channel->out->size();
+        foreach ($this->entries as $i => const &$entry) {
+            status<Error> $wrote = .ok;
+            if ($named) {
+                $wrote = $db->writeBind($statements[$which[$i]], $entry->params);
+            } else {
+                $wrote = $db->writeUnnamed($entry->sql, $entry->params);
+            }
+            if ($wrote->failed()) {
+                $db->channel->out = $db->channel->out->sub(0, $mark);
+                $this->failed = $i;
+                return .error($wrote->failure());
+            }
+        }
+        pgsql::protocol::sync($db->channel->out);
+        guard $db->sent($until) else ($e) {
+            return .error($e);
+        }
+
+        foreach ($this->entries as $i => const &$entry) {
+            Columns? $described = null;
+            if ($named) {
+                $described = $statements[$which[$i]]->columns;
+            }
+            result<Head, Error> $h = $db->head($described, $until);
+            if ($h->failed()) {
+                $this->failed = $i;
+                return .error($h->failure());
+            }
+            ResultSet $rs = guard $db->collect($h->unwrap(), $until) else ($e) {
+                $this->failed = $i;
+                return .error($e);
+            }
+            $out->push(mv $rs);
+        }
+        guard $db->drain($until) else ($e) {
+            return .error($e);
+        }
+        return .ok($db->settled($out));
+    }
+
+    /**
+     * The distinct statements the entries run, in `$distinct`, and which one each entry runs, in
+     * `$which`: from the cache, the ones not there prepared together in one round trip.
+     */
+    private function prepare(array<Prepared>& $distinct, array<usize>& $which, tcp::Deadline $by) : status<Error>
+    {
+        Connection $db = $this->db;
+        // which distinct statement each SQL is; most pipelines repeat one SQL, so the entry
+        // before is checked first
+        map<string, usize> $known = map<string, usize>();
+        usize $mark = $db->channel->out->size();
+        array<usize> $missing = array<usize>();
+        // the first entry that runs each missing statement
+        array<usize> $owner = array<usize>();
+        array<Placeholders> $parsed = array<Placeholders>();
+        foreach ($this->entries as $i => const &$entry) {
+            if ($i > 0 && $entry->sql == $this->entries[$i - 1]->sql) {
+                $which->push($which[$i - 1]);
+                continue;
+            }
+            if ($known->has($entry->sql)) {
+                $which->push($known->get($entry->sql));
+                continue;
+            }
+            usize $at = $distinct->count();
+            $known[$entry->sql] = $at;
+            $which->push($at);
+            Prepared? $hit = $db->cached($entry->sql);
+            if ($hit != null) {
+                Prepared $p = guard $hit;
+                $distinct->push($p);
+                continue;
+            }
+            string $name = $db->nextName('s');
+            Placeholders $ph = guard $db->parse($entry->sql, $name) else ($e) {
+                $db->channel->out = $db->channel->out->sub(0, $mark);
+                $this->failed = $i;
+                return .error($e);
+            }
+            // a placeholder until it is described
+            $distinct->push(Prepared($name, $ph->names, array<uint32>(), $db->none, array<int16>()));
+            $missing->push($at);
+            $owner->push($i);
+            $parsed->push(mv $ph);
+        }
+        if ($missing->empty()) {
+            return .ok;
+        }
+        pgsql::protocol::sync($db->channel->out);
+        guard $db->sent($by) else ($e) {
+            return .error($e);
+        }
+        foreach ($missing as $k => $slot) {
+            Prepared $p = guard $db->described($distinct[$slot]->name, $parsed[$k], $by) else ($e) {
+                // the first entry that runs this statement is the one that failed
+                $this->failed = $owner[$k];
+                return .error($e);
+            }
+            $distinct[$slot] = $p;
+        }
+        guard $db->settle($by) else ($e) {
+            return .error($e);
+        }
+        // kept in `$distinct` as well as in the cache: a statement the cache gives up here is only
+        // closed with the next command, after this pipeline has run it
+        foreach ($missing as $k => $slot) {
+            $db->remember($this->entries[$owner[$k]]->sql, $distinct[$slot]);
+        }
+        return .ok;
+    }
+}

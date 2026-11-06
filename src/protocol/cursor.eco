@@ -1,0 +1,154 @@
+/**
+ * A read position in one message body. Every read checks the bytes are there and answers
+ * `.malformed` when they are not. A server's message is input, so a short one is an error the
+ * caller hears about, never a read past the end. Integers are big-endian, as the protocol has them.
+ */
+
+namespace pgsql::protocol;
+
+internal struct Cursor
+{
+    internal string::view $data;
+    internal usize $at = 0;
+
+    internal const function left() : usize
+    {
+        return $this->data->size - $this->at;
+    }
+
+    internal const function done() : bool
+    {
+        return $this->at >= $this->data->size;
+    }
+
+    internal function skip(usize $n) : status<pgsql::Error>
+    {
+        guard $this->need($n, 'skip') else ($e) {
+            return .error($e);
+        }
+        $this->at = $this->at + $n;
+        return .ok;
+    }
+
+    internal function u8() : result<uint8, pgsql::Error>
+    {
+        guard $this->need(1, 'byte') else ($e) {
+            return .error($e);
+        }
+        uint8 $v = $this->data->byte($this->at);
+        $this->at = $this->at + 1;
+        return .ok($v);
+    }
+
+    internal function i16() : result<int16, pgsql::Error>
+    {
+        guard $this->need(2, 'int16') else ($e) {
+            return .error($e);
+        }
+        uint16 $v = tcp::wire::be16($this->data, $this->at);
+        $this->at = $this->at + 2;
+        return .ok($v as int16);
+    }
+
+    internal function u16() : result<uint16, pgsql::Error>
+    {
+        guard $this->need(2, 'uint16') else ($e) {
+            return .error($e);
+        }
+        uint16 $v = tcp::wire::be16($this->data, $this->at);
+        $this->at = $this->at + 2;
+        return .ok($v);
+    }
+
+    internal function i32() : result<int32, pgsql::Error>
+    {
+        guard $this->need(4, 'int32') else ($e) {
+            return .error($e);
+        }
+        uint32 $v = tcp::wire::be32($this->data, $this->at);
+        $this->at = $this->at + 4;
+        return .ok($v as int32);
+    }
+
+    internal function u32() : result<uint32, pgsql::Error>
+    {
+        guard $this->need(4, 'uint32') else ($e) {
+            return .error($e);
+        }
+        uint32 $v = tcp::wire::be32($this->data, $this->at);
+        $this->at = $this->at + 4;
+        return .ok($v);
+    }
+
+    internal function i64() : result<int64, pgsql::Error>
+    {
+        guard $this->need(8, 'int64') else ($e) {
+            return .error($e);
+        }
+        uint64 $v = tcp::wire::be64($this->data, $this->at);
+        $this->at = $this->at + 8;
+        return .ok($v as int64);
+    }
+
+    /**
+     * `$n` bytes, copied out.
+     */
+    internal function bytes(usize $n) : result<string, pgsql::Error>
+    {
+        guard $this->need($n, 'bytes') else ($e) {
+            return .error($e);
+        }
+        string $s = string::from($this->data->sub($this->at, $n));
+        $this->at = $this->at + $n;
+        return .ok($s);
+    }
+
+    /**
+     * `$n` bytes in place.
+     */
+    internal function view(usize $n) : result<string::view, pgsql::Error>
+    {
+        guard $this->need($n, 'bytes') else ($e) {
+            return .error($e);
+        }
+        string::view $s = $this->data->sub($this->at, $n);
+        $this->at = $this->at + $n;
+        return .ok($s);
+    }
+
+    /**
+     * A NUL-terminated string, consumed with its NUL. One that runs off the end is malformed.
+     */
+    internal function cstring() : result<string, pgsql::Error>
+    {
+        usize $i = $this->at;
+        usize $n = $this->data->size;
+        while ($i < $n) {
+            if ($this->data->byte($i) == 0) {
+                string $s = string::from($this->data->sub($this->at, $i - $this->at));
+                $this->at = $i + 1;
+                return .ok($s);
+            }
+            $i = $i + 1;
+        }
+        return .error(.malformed('a string without its terminating NUL'));
+    }
+
+    /**
+     * The bytes left, copied out.
+     */
+    internal function rest() : string
+    {
+        string $s = string::from($this->data->sub($this->at, $this->left()));
+        $this->at = $this->data->size;
+        return $s;
+    }
+
+    private const function need(usize $n, const string& $what) : status<pgsql::Error>
+    {
+        if ($this->left() < $n) {
+            return .error(.malformed("{$what}: {$n} bytes wanted, {$this->left()} left"));
+        }
+        return .ok;
+    }
+}

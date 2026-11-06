@@ -1,0 +1,197 @@
+/**
+ * The start of a session: the startup message, whichever authentication the server asks for, and
+ * what it reports before it is ready: the cancel key and the run-time parameters.
+ */
+
+namespace pgsql;
+
+use pgsql::protocol::{Message, AuthRequest};
+
+/**
+ * What login leaves behind.
+ */
+internal struct Session
+{
+    internal uint32 $protocol;
+    internal CancelKey $key;
+    internal uint8 $status;
+}
+
+internal struct Login
+{
+    internal Channel $channel;
+    internal Options $options;
+    internal tcp::Deadline $by;
+
+    /**
+     * Send the startup message and see the login through to the first ReadyForQuery.
+     */
+    internal function run() : result<Session, Error>
+    {
+        ordered_map<string, string> $params = ordered_map<string, string>();
+        $params['user'] = $this->options->user;
+        string? $db = $this->options->database;
+        if ($db != null) {
+            string $name = guard $db;
+            $params['database'] = $name;
+        }
+        if (!$this->options->applicationName->empty()) {
+            $params['application_name'] = $this->options->applicationName;
+        }
+        foreach ($this->options->settings as $k => $v) {
+            $params[$k] = $v;
+        }
+        // the decoders read text in these formats, whatever the server's defaults
+        $params['client_encoding'] = 'UTF8';
+        $params['DateStyle'] = 'ISO, MDY';
+        $params['extra_float_digits'] = '3';
+        uint32 $asked = $this->options->protocol->number();
+        pgsql::protocol::startup($this->channel->out, $asked, $params);
+        guard $this->channel->send($this->by) else ($e) {
+            return .error($e);
+        }
+
+        uint32 $protocol = $asked;
+        CancelKey? $key = null;
+        while (true) {
+            Message $m = guard $this->channel->next($this->by) else ($e) {
+                return .error($e);
+            }
+            if ($m->type == pgsql::protocol::AUTH) {
+                AuthRequest $r = guard pgsql::protocol::authRequest($m->body) else ($e) {
+                    return .error($e);
+                }
+                guard $this->answer($r) else ($e) {
+                    return .error($e);
+                }
+            } else if ($m->type == pgsql::protocol::BACKEND_KEY) {
+                CancelKey $k = guard pgsql::protocol::backendKey($m->body) else ($e) {
+                    return .error($e);
+                }
+                $key = $k;
+            } else if ($m->type == pgsql::protocol::NEGOTIATE) {
+                pgsql::protocol::Negotiated $n = guard pgsql::protocol::negotiated($m->body) else ($e) {
+                    return .error($e);
+                }
+                uint32 $offered = (pgsql::protocol::PROTOCOL_3_0 & 4294901760) | $n->minor;
+                if ($offered > $asked || $offered < pgsql::protocol::PROTOCOL_3_0) {
+                    return .error(.malformed("the server offers protocol minor {$n->minor}"));
+                }
+                $protocol = $offered;
+            } else if ($m->type == pgsql::protocol::ERROR) {
+                return .error(.server(pgsql::protocol::serverError($m->body)));
+            } else if ($m->type == pgsql::protocol::READY) {
+                uint8 $status = guard pgsql::protocol::readyStatus($m->body) else ($e) {
+                    return .error($e);
+                }
+                // a server that takes no cancel requests sends no key; one that cannot match
+                CancelKey $none = CancelKey(0, '');
+                return .ok(Session($protocol, $key ?? $none, $status));
+            } else {
+                return .error(.malformed("message {$m->type} during login"));
+            }
+        }
+    }
+
+    /**
+     * Answer one authentication request. OK needs no answer; SASL runs its whole exchange here.
+     */
+    private function answer(const AuthRequest& $r) : status<Error>
+    {
+        if ($r->code == pgsql::protocol::AUTH_OK) {
+            return .ok;
+        }
+        if ($r->code == pgsql::protocol::AUTH_CLEARTEXT) {
+            if (!$this->channel->local() && !$this->options->allowCleartext) {
+                return .error(.auth(.needsSecureTransport));
+            }
+            pgsql::protocol::password($this->channel->out, $this->options->password);
+            return $this->channel->send($this->by);
+        }
+        if ($r->code == pgsql::protocol::AUTH_MD5) {
+            if ($r->data->size() != 4) {
+                return .error(.malformed("an md5 salt of {$r->data->size()} bytes"));
+            }
+            pgsql::protocol::password($this->channel->out, pgsql::auth::md5($this->options->user, $this->options->password, $r->data));
+            return $this->channel->send($this->by);
+        }
+        if ($r->code == pgsql::protocol::AUTH_SASL) {
+            return $this->sasl($r->data);
+        }
+        if ($r->code == pgsql::protocol::AUTH_KERBEROS) {
+            return .error(.auth(.unsupported('Kerberos V5')));
+        }
+        if ($r->code == pgsql::protocol::AUTH_GSS || $r->code == pgsql::protocol::AUTH_GSS_CONTINUE) {
+            return .error(.auth(.unsupported('GSSAPI')));
+        }
+        if ($r->code == pgsql::protocol::AUTH_SSPI) {
+            return .error(.auth(.unsupported('SSPI')));
+        }
+        return .error(.auth(.unsupported("request {$r->code}")));
+    }
+
+    /**
+     * SCRAM-SHA-256 from the offer to the server's final message.
+     */
+    private function sasl(const string& $offer) : status<Error>
+    {
+        array<string> $mechanisms = guard pgsql::protocol::mechanisms($offer) else ($e) {
+            return .error($e);
+        }
+        bool $scram = false;
+        foreach ($mechanisms as const &$m) {
+            if ($m == pgsql::auth::MECHANISM) {
+                $scram = true;
+            }
+        }
+        if (!$scram) {
+            string $offered = str::join($mechanisms, ', ');
+            return .error(.auth(.unsupported("SASL ({$offered})")));
+        }
+        pgsql::auth::Scram $s = guard pgsql::auth::Scram::start($this->options->password) else ($e) {
+            return .error($e);
+        }
+        pgsql::protocol::saslInitial($this->channel->out, pgsql::auth::MECHANISM, $s->first());
+        guard $this->channel->send($this->by) else ($e) {
+            return .error($e);
+        }
+        string $serverFirst = guard $this->step(pgsql::protocol::AUTH_SASL_CONTINUE) else ($e) {
+            return .error($e);
+        }
+        string $final = guard $s->final($serverFirst) else ($e) {
+            return .error($e);
+        }
+        pgsql::protocol::saslResponse($this->channel->out, $final);
+        guard $this->channel->send($this->by) else ($e) {
+            return .error($e);
+        }
+        string $serverFinal = guard $this->step(pgsql::protocol::AUTH_SASL_FINAL) else ($e) {
+            return .error($e);
+        }
+        return $s->verify($serverFinal);
+    }
+
+    /**
+     * The data of the next SASL step, which has to be `$code`. An error message instead is the
+     * server refusing the password.
+     */
+    private function step(uint32 $code) : result<string, Error>
+    {
+        Message $m = guard $this->channel->next($this->by) else ($e) {
+            return .error($e);
+        }
+        if ($m->type == pgsql::protocol::ERROR) {
+            return .error(.server(pgsql::protocol::serverError($m->body)));
+        }
+        if ($m->type != pgsql::protocol::AUTH) {
+            return .error(.malformed("message {$m->type} in the middle of SASL"));
+        }
+        AuthRequest $r = guard pgsql::protocol::authRequest($m->body) else ($e) {
+            return .error($e);
+        }
+        if ($r->code != $code) {
+            return .error(.malformed("SASL step {$r->code} where {$code} was due"));
+        }
+        return .ok($r->data);
+    }
+}

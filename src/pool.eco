@@ -1,0 +1,529 @@
+namespace pgsql;
+
+use std::thread;
+use std::time;
+
+/**
+ * How many connections a pool keeps, and for how long. Plain data.
+ */
+public struct PoolOptions
+{
+    /**
+     * Connections open at most, lent and idle together.
+     */
+    public usize $max = 10;
+
+    /**
+     * Idle connections kept at most. One given back beyond this is closed.
+     */
+    public usize $maxIdle = 10;
+
+    /**
+     * An idle connection older than this is closed instead of lent. Null keeps them.
+     */
+    public time::duration? $idleTimeout = time::duration::mins(10);
+
+    /**
+     * A connection older than this is closed when it comes back. Null keeps it for good.
+     */
+    public time::duration? $maxLifetime = null;
+
+    /**
+     * How long `acquire` waits for a connection when the call names no deadline.
+     */
+    public time::duration $acquireTimeout = time::duration::secs(30);
+
+    /**
+     * A connection idle longer than this is pinged before it is lent, so a server that dropped
+     * it is found here, not in the caller's first query.
+     */
+    public time::duration $pingAfterIdle = time::duration::secs(1);
+}
+
+internal struct Idle
+{
+    internal Connection $db;
+    internal time::instant $since;
+    internal time::instant $born;
+}
+
+/**
+ * One thread waiting for a connection. Fields are only touched with the pool's lock held.
+ */
+#[atomic]
+internal class Waiter
+{
+    internal uint64 $ticket;
+    internal tcp::Waker $waker;
+    internal Connection? $handed;
+    internal time::instant $born;
+    // woken to look again: the pool closed, or a slot it could not hand over opened up
+    internal bool $room;
+    // handed the slot of a connection that went away: open one in its place
+    internal bool $grow;
+
+    internal constructor(uint64 $ticket, tcp::Waker $waker)
+    {
+        $this->ticket = $ticket;
+        $this->waker = $waker;
+        $this->handed = null;
+        $this->born = time::instant::now();
+        $this->room = false;
+        $this->grow = false;
+    }
+}
+
+internal struct PoolState
+{
+    internal array<Idle> $idle;
+    internal usize $open = 0;
+    internal bool $closed = false;
+    internal array<Waiter> $waiters;
+    internal array<tcp::Waker> $spare;
+    internal uint64 $tickets = 0;
+}
+
+#[docs::groups: ["Leasing", "Queries", "Transactions"]]
+
+/**
+ * Connections shared by many threads. `acquire` lends one out as a `Lease`, which gives it back
+ * when dropped; `query`, `exec` and `transaction` do that around one call. A thread that finds
+ * every connection lent out waits its turn: waiters are served first come, first served, each
+ * handed the next connection given back, or the slot of one that went away.
+ *
+ * The pool and its leases may be shared by any number of threads. What a lease lends is not:
+ * the `Connection`, and the `Rows`, `Row`, `ResultSet`, `Statement`, `Transaction` and `Params`
+ * made with it, stay on the thread holding the lease, and are let go before it is released.
+ *
+ * ```echo
+ * pgsql::Pool $p = pgsql::Pool($options);
+ * $rs = guard $p->query('SELECT 1 AS n');
+ * echo $rs[0]['n'];           // 1
+ * ```
+ */
+#[atomic]
+public class Pool
+{
+    // how long giving back a lease waits for its ROLLBACK when the options name no timeout
+    internal const time::duration ROLLBACK_TIMEOUT = time::duration::secs(5);
+
+    #[docs::group: "Leasing"]
+    public const Options $options;
+
+    #[docs::group: "Leasing"]
+    public const PoolOptions $limits;
+    private thread::mutex<PoolState> $state;
+
+    #[docs::group: "Leasing"]
+    public constructor(Options $options, PoolOptions $limits = PoolOptions())
+    {
+        $this->options = $options;
+        $this->limits = $limits;
+        $this->state = thread::mutex<PoolState>(PoolState(array<Idle>(), 0, false, array<Waiter>(), array<tcp::Waker>(), 0));
+    }
+
+    /**
+     * Borrow a connection: an idle one, a new one while there is room, or the next one given
+     * back. `.exhausted` when none came free before the deadline.
+     */
+    #[docs::group: "Leasing"]
+    public function acquire(by: tcp::Deadline? $by = null) : result<Lease, Error>
+    {
+        tcp::Deadline $until = $by ?? tcp::Deadline(after: $this->limits->acquireTimeout);
+        while (true) {
+            array<Connection> $stale = array<Connection>();
+            Idle? $found = null;
+            bool $grow = false;
+            Waiter? $waiting = null;
+            {
+                thread::locked<PoolState> $s = $this->state->lock();
+                if ($s->value->closed) {
+                    return .error(.closed);
+                }
+                while (!$s->value->idle->empty()) {
+                    Idle $i = $s->value->idle->pop();
+                    if ($this->expired($i) || !$i->db->alive()) {
+                        $s->value->open = $s->value->open - 1;
+                        $stale->push($i->db);
+                        continue;
+                    }
+                    Idle? $take = $i;
+                    $found = $take;
+                    break;
+                }
+                if ($found == null) {
+                    if ($s->value->open < $this->limits->max) {
+                        $s->value->open = $s->value->open + 1;
+                        $grow = true;
+                    } else {
+                        tcp::Waker $w = guard $this->waker($s->value) else ($e) {
+                            return .error($e);
+                        }
+                        $s->value->tickets = $s->value->tickets + 1;
+                        Waiter $me = Waiter($s->value->tickets, $w);
+                        $s->value->waiters->push($me);
+                        Waiter? $queued = $me;
+                        $waiting = $queued;
+                    }
+                }
+            }
+            foreach ($stale as $old) {
+                $old->close();
+            }
+
+            Idle? $ready = $found;
+            if ($ready != null) {
+                Idle $i = guard $ready;
+                if ($i->since->elapsed() > $this->limits->pingAfterIdle) {
+                    status<Error> $alive = $i->db->ping(by: $until);
+                    if ($alive->failed()) {
+                        $this->forget($i->db);
+                        continue;
+                    }
+                }
+                return .ok(Lease($this, $i->db, $i->born));
+            }
+
+            if ($grow) {
+                return $this->fresh();
+            }
+
+            Waiter $me = guard $waiting;
+            bool $signalled = $me->waker->wait($until);
+            Connection? $handed = null;
+            time::instant $born = time::instant::now();
+            bool $room = false;
+            bool $slot = false;
+            {
+                thread::locked<PoolState> $s = $this->state->lock();
+                $handed = $me->handed;
+                $born = $me->born;
+                $room = $me->room;
+                $slot = $me->grow;
+                // this waiter is done either way: off the queue, its waker back for reuse
+                usize $at = 0;
+                while ($at < $s->value->waiters->count()) {
+                    if ($s->value->waiters[$at]->ticket == $me->ticket) {
+                        $s->value->waiters->remove($at);
+                        break;
+                    }
+                    $at = $at + 1;
+                }
+                $me->waker->reset();
+                $s->value->spare->push($me->waker);
+            }
+            if ($handed != null) {
+                Connection $db = guard $handed;
+                return .ok(Lease($this, $db, $born));
+            }
+            if ($slot) {
+                // the slot is already counted for this waiter, so no newcomer can take it
+                return $this->fresh();
+            }
+            if ($room) {
+                continue;
+            }
+            if (!$signalled || $until->passed()) {
+                return .error(.exhausted);
+            }
+        }
+    }
+
+    /**
+     * A new connection for a slot already counted. A failure gives the slot back.
+     */
+    private function fresh() : result<Lease, Error>
+    {
+        Connection $db = guard Connection::open($this->options) else ($e) {
+            $this->forget(null);
+            return .error($e);
+        }
+        return .ok(Lease($this, $db, time::instant::now()));
+    }
+
+    /**
+     * Close the idle connections and refuse new leases. Connections still lent are closed as they
+     * come back.
+     */
+    #[docs::group: "Leasing"]
+    public function close() : void
+    {
+        array<Connection> $idle = array<Connection>();
+        {
+            thread::locked<PoolState> $s = $this->state->lock();
+            $s->value->closed = true;
+            foreach ($s->value->idle as $i) {
+                $idle->push($i->db);
+            }
+            $s->value->open = $s->value->open - $s->value->idle->count();
+            $s->value->idle->clear();
+            foreach ($s->value->waiters as $w) {
+                $w->room = true;
+                $w->waker->wake();
+            }
+        }
+        foreach ($idle as $db) {
+            $db->close();
+        }
+    }
+
+    /**
+     * Connections open now, lent and idle together.
+     */
+    #[docs::group: "Leasing"]
+    public function open() : usize
+    {
+        thread::locked<PoolState> $s = $this->state->lock();
+        return $s->value->open;
+    }
+
+    #[docs::group: "Leasing"]
+    public function idle() : usize
+    {
+        thread::locked<PoolState> $s = $this->state->lock();
+        return $s->value->idle->count();
+    }
+
+    // the connection verbs, each around one lease
+
+    /**
+     * Run `$sql` on a leased connection and read the whole result.
+     */
+    #[docs::group: "Queries"]
+    public function query(const string& $sql, by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        Lease $l = guard $this->acquire(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $l->db()->query($sql, by: $by);
+    }
+
+    /**
+     * Run `$sql` with `$params` on a leased connection and read the whole result.
+     */
+    #[docs::group: "Queries"]
+    public function query(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<ResultSet, Error>
+    {
+        Lease $l = guard $this->acquire(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $l->db()->query($sql, $params, by: $by);
+    }
+
+    /**
+     * Run `$sql` on a leased connection and return what it did.
+     */
+    #[docs::group: "Queries"]
+    public function exec(const string& $sql, by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        Lease $l = guard $this->acquire(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $l->db()->exec($sql, by: $by);
+    }
+
+    /**
+     * Run `$sql` with `$params` on a leased connection and return what it did.
+     */
+    #[docs::group: "Queries"]
+    public function exec(const string& $sql, Params $params, by: tcp::Deadline? $by = null) : result<Outcome, Error>
+    {
+        Lease $l = guard $this->acquire(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $l->db()->exec($sql, $params, by: $by);
+    }
+
+    /**
+     * Run `$work` in a transaction on one leased connection: commit on `.ok`, roll back on
+     * `.error`.
+     */
+    #[docs::group: "Transactions"]
+    public function transaction(function<status<Error>(Connection)> $work, by: tcp::Deadline? $by = null) : status<Error>
+    {
+        Lease $l = guard $this->acquire(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $l->db()->transaction($work, by: $by);
+    }
+
+    /**
+     * Run `$work` in a transaction on one leased connection and hand back its value.
+     */
+    #[docs::group: "Transactions"]
+    public function transaction<T>(function<result<T, Error>(Connection)> $work, by: tcp::Deadline? $by = null) : result<T, Error>
+    {
+        Lease $l = guard $this->acquire(by: $by) else ($e) {
+            return .error($e);
+        }
+        return $l->db()->transact<T>($work, $by);
+    }
+
+    /**
+     * A lent connection comes back. A healthy one goes to the first waiter, or to the idle list.
+     * A dead, busy, too old or surplus one is closed and its slot freed.
+     */
+    internal function give(Connection $db, time::instant $born) : void
+    {
+        bool $healthy = $db->alive() && !$db->busy && !$db->pending && !$this->tooOld($born);
+        if ($healthy && $db->inTransaction()) {
+            // a lease dropped mid-transaction (or in a failed one): undo it, or the next borrower
+            // inherits it; a server that does not answer in time costs the connection, not the
+            // thread giving it back
+            tcp::Deadline $by = tcp::Deadline(after: $this->options->timeout ?? Pool::ROLLBACK_TIMEOUT);
+            result<Outcome, Error> $undone = $db->exec('ROLLBACK', by: $by);
+        }
+        $this->settle($db, $born, $healthy && !$db->inTransaction() && $db->alive());
+    }
+
+    private function settle(Connection $db, time::instant $born, bool $healthy) : void
+    {
+        bool $drop = false;
+        {
+            thread::locked<PoolState> $s = $this->state->lock();
+            if ($s->value->closed) {
+                // close() already woke every waiter
+                $s->value->open = $s->value->open - 1;
+                $drop = true;
+            } else if (!$healthy) {
+                $drop = true;
+                $this->pass($s->value);
+            } else if (!$s->value->waiters->empty()) {
+                Waiter $w = $s->value->waiters[0];
+                $s->value->waiters->remove(0);
+                Connection? $give = $db;
+                $w->handed = $give;
+                $w->born = $born;
+                $w->waker->wake();
+            } else if ($s->value->idle->count() < $this->limits->maxIdle) {
+                $s->value->idle->push(Idle($db, time::instant::now(), $born));
+            } else {
+                $s->value->open = $s->value->open - 1;
+                $drop = true;
+            }
+        }
+        if ($drop) {
+            $db->close();
+        }
+    }
+
+    /**
+     * A connection that was counted is gone, or one that was going to be opened never came.
+     */
+    private function forget(Connection? $db) : void
+    {
+        {
+            thread::locked<PoolState> $s = $this->state->lock();
+            if ($s->value->closed) {
+                $s->value->open = $s->value->open - 1;
+            } else {
+                $this->pass($s->value);
+            }
+        }
+        $db?->close();
+    }
+
+    /**
+     * The slot of a connection that is gone goes to the first waiter, still counted, so it opens
+     * a connection in its place before anyone arriving later can. With nobody waiting it is
+     * freed. Called with the lock held.
+     */
+    private function pass(PoolState& $s) : void
+    {
+        if ($s->waiters->empty()) {
+            $s->open = $s->open - 1;
+            return;
+        }
+        Waiter $w = $s->waiters[0];
+        $s->waiters->remove(0);
+        $w->grow = true;
+        $w->waker->wake();
+    }
+
+    private const function expired(const Idle& $i) : bool
+    {
+        if ($this->tooOld($i->born)) {
+            return true;
+        }
+        time::duration? $limit = $this->limits->idleTimeout;
+        if ($limit == null) {
+            return false;
+        }
+        time::duration $l = guard $limit;
+        return $i->since->elapsed() > $l;
+    }
+
+    private const function tooOld(time::instant $born) : bool
+    {
+        time::duration? $limit = $this->limits->maxLifetime;
+        if ($limit == null) {
+            return false;
+        }
+        time::duration $l = guard $limit;
+        return $born->elapsed() > $l;
+    }
+
+    /**
+     * A waker to park on: one given back by an earlier waiter, or a new one.
+     */
+    private function waker(PoolState& $s) : result<tcp::Waker, Error>
+    {
+        if (!$s->spare->empty()) {
+            return .ok($s->spare->pop());
+        }
+        tcp::Waker $w = guard tcp::Waker::open() else ($e) {
+            return .error(.transport($e));
+        }
+        return .ok($w);
+    }
+}
+
+/**
+ * A connection borrowed from a `Pool`. It goes back when the lease is dropped, or at `release()`.
+ * The lease itself may be shared between threads; the connection it lends may not.
+ */
+#[atomic]
+public class Lease
+{
+    private Connection $db;
+    private Pool $pool;
+    private time::instant $born;
+    private atomic<bool> $returned;
+
+    internal constructor(Pool $pool, Connection $db, time::instant $born)
+    {
+        $this->pool = $pool;
+        $this->db = $db;
+        $this->born = $born;
+        $this->returned = atomic<bool>(false);
+    }
+
+    destructor()
+    {
+        $this->release();
+    }
+
+    /**
+     * The lent connection. Asking after `release()` is a bug, the connection may already
+     * belong to another thread, and stops the program.
+     */
+    public function db() : Connection
+    {
+        if ($this->returned->load()) {
+            die('pgsql: the lease was released; its connection belongs to the pool again');
+        }
+        return $this->db;
+    }
+
+    /**
+     * Give the connection back now. Safe to call twice, and from two threads at once: only the
+     * first call gives it back.
+     */
+    public function release() : void
+    {
+        if ($this->returned->exchange(true)) {
+            return;
+        }
+        $this->pool->give($this->db, $this->born);
+    }
+}

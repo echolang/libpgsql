@@ -1,0 +1,234 @@
+/**
+ * Arrays both ways: the binary form (dimensions, lower bounds, element type, then each element as
+ * a length and its bytes) and the text form (`{1,2,NULL,"a b"}`, nested braces for more
+ * dimensions).
+ */
+
+namespace pgsql::protocol;
+
+use pgsql::Value;
+
+// PostgreSQL's own limit
+internal const uint32 MAX_DIMENSIONS = 6;
+
+/**
+ * A binary array. Its element type comes with it.
+ */
+internal function binaryArray(string::view $v) : result<Value, pgsql::Error>
+{
+    Cursor $c = Cursor($v);
+    int32 $dims = guard $c->i32() else ($e) {
+        return .error($e);
+    }
+    $c->skip(4);
+    uint32 $el = guard $c->u32() else ($e) {
+        return .error($e);
+    }
+    if ($dims < 0 || ($dims as uint32) > MAX_DIMENSIONS) {
+        return .error(.malformed("an array of {$dims} dimensions"));
+    }
+    if ($dims == 0) {
+        return .ok(.list(array<Value>()));
+    }
+    array<usize> $sizes = array<usize>();
+    usize $total = 1;
+    int32 $d = 0;
+    while ($d < $dims) {
+        int32 $n = guard $c->i32() else ($e) {
+            return .error($e);
+        }
+        $c->skip(4);
+        // every element takes at least its 4-byte length, which bounds a lying count
+        if ($n < 0 || ($n as usize) > $c->left() / 4 + 1) {
+            return .error(.malformed("an array dimension of {$n}"));
+        }
+        $sizes->push($n as usize);
+        $total = $total * ($n as usize);
+        // every element takes its 4-byte length at least: more than fit is a lie
+        if ($total > $c->left() / 4) {
+            return .error(.malformed("an array of {$total} elements in {$c->left()} bytes"));
+        }
+        $d = $d + 1;
+    }
+    Shape $s = shape($el);
+    if ($s == Shape::array) {
+        // dimensions nest an array, never its element type
+        return .error(.malformed('an array whose elements are arrays'));
+    }
+    array<Value> $flat = arr::room<Value>($total);
+    usize $i = 0;
+    while ($i < $total) {
+        uint32 $len = guard $c->u32() else ($e) {
+            return .error($e);
+        }
+        if ($len == NULL_AT) {
+            $flat->push(Value::none);
+        } else {
+            string::view $bytes = guard $c->view($len as usize) else ($e) {
+                return .error($e);
+            }
+            Value $item = guard binaryValue($s, $el, $bytes) else ($e) {
+                return .error($e);
+            }
+            $flat->push(mv $item);
+        }
+        $i = $i + 1;
+    }
+    if (!$c->done()) {
+        return .error(.malformed("{$c->left()} bytes after the last element"));
+    }
+    return .ok(nest(mv $flat, $sizes));
+}
+
+/**
+ * Elements in row-major order as lists of lists, one level per dimension.
+ */
+internal function nest(mv array<Value> $flat, const array<usize>& $sizes) : Value
+{
+    if ($sizes->count() == 1) {
+        return .list(mv $flat);
+    }
+    usize $d = $sizes->count() - 1;
+    array<Value> $level = mv $flat;
+    while ($d > 0) {
+        usize $width = $sizes[$d];
+        array<Value> $up = array<Value>();
+        usize $at = 0;
+        while ($at < $level->count()) {
+            array<Value> $group = arr::room<Value>($width);
+            usize $k = 0;
+            while ($k < $width) {
+                $group->push($level[$at + $k]);
+                $k = $k + 1;
+            }
+            $up->push(.list(mv $group));
+            $at = $at + $width;
+        }
+        $level = mv $up;
+        $d = $d - 1;
+    }
+    return .list($level);
+}
+
+/**
+ * A text array: `{...}`, maybe after dimension bounds (`[0:2]={...}`). Elements are decoded as
+ * `$s`, an unquoted NULL is NULL.
+ */
+internal function textArray(const string& $t, Shape $s, uint32 $el) : result<Value, pgsql::Error>
+{
+    usize $at = 0;
+    if ($t->starts('[')) {
+        usize $eq = $t->find('=');
+        if ($eq == $t->size()) {
+            return .error(.malformed('array bounds without the ='));
+        }
+        $at = $eq + 1;
+    }
+    TextArray $p = TextArray($t, $at, $s, $el);
+    Value $v = guard $p->list(0) else ($e) {
+        return .error($e);
+    }
+    if ($p->at != $t->size()) {
+        return .error(.malformed('text after the array'));
+    }
+    return .ok($v);
+}
+
+internal struct TextArray
+{
+    internal string $t;
+    internal usize $at;
+    internal Shape $shape;
+    internal uint32 $el;
+
+    /**
+     * `{` elements `}`, at `$at`.
+     */
+    internal function list(usize $depth) : result<Value, pgsql::Error>
+    {
+        if ($depth >= MAX_DIMENSIONS as usize || $this->at >= $this->t->size() || $this->t->byte($this->at) != 123) {
+            return .error(.malformed('an array that does not start with {'));
+        }
+        $this->at = $this->at + 1;
+        array<Value> $items = array<Value>();
+        if ($this->at < $this->t->size() && $this->t->byte($this->at) == 125) {
+            $this->at = $this->at + 1;
+            return .ok(.list($items));
+        }
+        while (true) {
+            if ($this->at >= $this->t->size()) {
+                return .error(.malformed('an array without its closing }'));
+            }
+            uint8 $c = $this->t->byte($this->at);
+            if ($c == 123) {
+                Value $inner = guard $this->list($depth + 1) else ($e) {
+                    return .error($e);
+                }
+                $items->push($inner);
+            } else {
+                Value $item = guard $this->item() else ($e) {
+                    return .error($e);
+                }
+                $items->push($item);
+            }
+            if ($this->at >= $this->t->size()) {
+                return .error(.malformed('an array without its closing }'));
+            }
+            uint8 $next = $this->t->byte($this->at);
+            $this->at = $this->at + 1;
+            if ($next == 125) {
+                return .ok(.list($items));
+            }
+            if ($next != 44) {
+                return .error(.malformed('array elements not separated by ,'));
+            }
+        }
+    }
+
+    /**
+     * One element: quoted with backslash escapes, or bare up to the next `,` or `}`.
+     */
+    private function item() : result<Value, pgsql::Error>
+    {
+        string $raw = '';
+        if ($this->t->byte($this->at) == 34) {
+            $this->at = $this->at + 1;
+            while (true) {
+                if ($this->at >= $this->t->size()) {
+                    return .error(.malformed('an array element without its closing quote'));
+                }
+                uint8 $c = $this->t->byte($this->at);
+                if ($c == 34) {
+                    $this->at = $this->at + 1;
+                    break;
+                }
+                if ($c == 92) {
+                    $this->at = $this->at + 1;
+                    if ($this->at >= $this->t->size()) {
+                        return .error(.malformed('an array element ending in a backslash'));
+                    }
+                    $c = $this->t->byte($this->at);
+                }
+                $raw->push($c);
+                $this->at = $this->at + 1;
+            }
+            return textValue($this->shape, $this->el, $raw);
+        }
+        usize $start = $this->at;
+        while ($this->at < $this->t->size()) {
+            uint8 $b = $this->t->byte($this->at);
+            if ($b == 44 || $b == 125) {
+                break;
+            }
+            $this->at = $this->at + 1;
+        }
+        $raw = $this->t->sub($start, $this->at - $start);
+        if ($raw->empty()) {
+            return .error(.malformed('an empty array element'));
+        }
+        if ($raw == 'NULL') {
+            return .ok(Value::none);
+        }
+        return textValue($this->shape, $this->el, $raw);
+    }
+}

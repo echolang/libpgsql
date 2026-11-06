@@ -1,0 +1,58 @@
+/**
+ * SCRAM-SHA-256 against RFC 7677's example, PBKDF2 against known vectors, and md5.
+ */
+
+test hi_matches_pbkdf2_hmac_sha256
+{
+    assert(crypto::hex(pgsql::auth::hi('passwd', 'salt', 1)) == '55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc');
+    assert(crypto::hex(pgsql::auth::hi('password', 'salt', 4096)) == 'c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a');
+}
+
+test scram_follows_rfc_7677
+{
+    pgsql::auth::Scram $s = pgsql::auth::Scram('user', 'pencil', 'rOprNGfwEbeRWgbNEkqO');
+    assert($s->first() == 'n,,n=user,r=rOprNGfwEbeRWgbNEkqO');
+    string $final = $s->final('r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096')->unwrap();
+    assert($final == 'c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=');
+    assert(!$s->verify('v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=')->failed());
+    // one bit off is a server that does not know the password
+    assert($s->verify('v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G5=')->failed());
+    assert($s->verify('e=invalid-proof')->failed());
+    assert($s->verify('nothing')->failed());
+}
+
+test scram_refuses_a_bad_server_first_message
+{
+    pgsql::auth::Scram $s = pgsql::auth::Scram('', 'pencil', 'abc');
+    // a nonce that does not extend ours
+    assert($s->final('r=xyz123,s=c2FsdA==,i=4096')->failed());
+    // ours, not extended
+    assert($s->final('r=abc,s=c2FsdA==,i=4096')->failed());
+    assert($s->final('r=abcd,s=***,i=4096')->failed());
+    assert($s->final('r=abcd,s=,i=4096')->failed());
+    assert($s->final('r=abcd,s=c2FsdA==,i=0')->failed());
+    assert($s->final('r=abcd,s=c2FsdA==,i=x')->failed());
+    assert($s->final('r=abcd,s=c2FsdA==,i=99999999999')->failed());
+    assert($s->final('m=ext,r=abcd,s=c2FsdA==,i=4096')->failed());
+    // no final message checks out before a server-first was answered
+    assert($s->verify('v=AAAA')->failed());
+}
+
+test scram_start_makes_a_fresh_nonce
+{
+    pgsql::auth::Scram $a = pgsql::auth::Scram::start('pw')->unwrap();
+    pgsql::auth::Scram $b = pgsql::auth::Scram::start('pw')->unwrap();
+    assert($a->first()->starts('n,,n=,r='));
+    assert($a->first()->size() == 8 + 24);
+    assert($a->first() != $b->first());
+}
+
+test md5_answer_is_md5_of_md5
+{
+    string $salt = '';
+    $salt->push(1);
+    $salt->push(2);
+    $salt->push(3);
+    $salt->push(4);
+    assert(pgsql::auth::md5('app', 'secret', $salt) == 'md5911f527656472583a006e7727877b33e');
+}

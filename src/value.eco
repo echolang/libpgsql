@@ -1,0 +1,439 @@
+namespace pgsql;
+
+/**
+ * One column value, the same shape whether it arrived as text or binary, and one parameter value
+ * on the way in. Typed reads answer null when the value is not that type, so `guard`, `??` and
+ * `?->` do the rest.
+ *
+ * ```echo
+ * pgsql::Value $v = .int(12);
+ * echo $v->int() ?? 0;        // 12
+ * echo "{$v}";                // 12
+ * ```
+ */
+public enum Value
+{
+    /**
+     * SQL NULL.
+     */
+    case none;
+
+    case bool(bool $v);
+
+    /**
+     * A SMALLINT, INTEGER, BIGINT or OID.
+     */
+    case int(int64 $v);
+
+    /**
+     * A REAL or DOUBLE PRECISION.
+     */
+    case float(float64 $v);
+
+    /**
+     * A NUMERIC, kept as the server wrote it so nothing is rounded. `NaN` and the infinities
+     * included.
+     */
+    case numeric(string $v);
+
+    /**
+     * Text: TEXT, VARCHAR, CHAR, NAME, and every type this library does not decode (an enum, a
+     * range, an inet), as the server writes it.
+     */
+    case text(string $v);
+
+    /**
+     * A BYTEA, or a parameter that must not be read as text.
+     */
+    case bytes(string $v);
+
+    /**
+     * JSON or JSONB, as text. Parsing it is a JSON library's job.
+     */
+    case json(string $v);
+
+    case uuid(Uuid $v);
+    case date(Date $v);
+    case time(Time $v);
+
+    /**
+     * A TIMESTAMP: a date and a time, no zone.
+     */
+    case timestamp(DateTime $v);
+
+    /**
+     * A TIMESTAMPTZ: an instant, in UTC.
+     */
+    case timestamptz(DateTime $v);
+
+    case interval(Interval $v);
+
+    /**
+     * An array, its elements in order. A multi-dimensional array is a list of lists; lower bounds
+     * other than 1 are not kept.
+     */
+    case list(array<Value> $items);
+
+    #[implicit]
+    public static function from(bool $v) : Value
+    {
+        return .bool($v);
+    }
+
+    #[implicit]
+    public static function from(int32 $v) : Value
+    {
+        return .int($v as int64);
+    }
+
+    #[implicit]
+    public static function from(int64 $v) : Value
+    {
+        return .int($v);
+    }
+
+    #[implicit]
+    public static function from(uint32 $v) : Value
+    {
+        return .int($v as int64);
+    }
+
+    #[implicit]
+    public static function from(float64 $v) : Value
+    {
+        return .float($v);
+    }
+
+    #[implicit]
+    public static function from(string $v) : Value
+    {
+        return .text($v);
+    }
+
+    #[implicit]
+    public static function from(Uuid $v) : Value
+    {
+        return .uuid($v);
+    }
+
+    #[implicit]
+    public static function from(Date $v) : Value
+    {
+        return .date($v);
+    }
+
+    #[implicit]
+    public static function from(Time $v) : Value
+    {
+        return .time($v);
+    }
+
+    /**
+     * A `DateTime` as a TIMESTAMP. Sent to a TIMESTAMPTZ parameter, it is taken as UTC.
+     */
+    #[implicit]
+    public static function from(DateTime $v) : Value
+    {
+        return .timestamp($v);
+    }
+
+    #[implicit]
+    public static function from(Interval $v) : Value
+    {
+        return .interval($v);
+    }
+
+    #[implicit]
+    public static function from(bool? $v) : Value
+    {
+        bool $b = guard $v else {
+            return .none;
+        }
+        return .bool($b);
+    }
+
+    #[implicit]
+    public static function from(int32? $v) : Value
+    {
+        int32 $n = guard $v else {
+            return .none;
+        }
+        return .int($n as int64);
+    }
+
+    #[implicit]
+    public static function from(int64? $v) : Value
+    {
+        int64 $n = guard $v else {
+            return .none;
+        }
+        return .int($n);
+    }
+
+    #[implicit]
+    public static function from(float64? $v) : Value
+    {
+        float64 $f = guard $v else {
+            return .none;
+        }
+        return .float($f);
+    }
+
+    #[implicit]
+    public static function from(string? $v) : Value
+    {
+        string $s = guard $v else {
+            return .none;
+        }
+        return .text($s);
+    }
+
+    #[implicit]
+    public static function from(Date? $v) : Value
+    {
+        Date $d = guard $v else {
+            return .none;
+        }
+        return .date($d);
+    }
+
+    #[implicit]
+    public static function from(DateTime? $v) : Value
+    {
+        DateTime $d = guard $v else {
+            return .none;
+        }
+        return .timestamp($d);
+    }
+
+    /**
+     * An array parameter: `WHERE id = ANY(:ids)`.
+     */
+    #[implicit]
+    public static function from(array<int64> $v) : Value
+    {
+        array<Value> $items = arr::room<Value>($v->count());
+        foreach ($v as $n) {
+            $items->push(.int($n));
+        }
+        return .list($items);
+    }
+
+    #[implicit]
+    public static function from(array<int32> $v) : Value
+    {
+        array<Value> $items = arr::room<Value>($v->count());
+        foreach ($v as $n) {
+            int32 $x = $n;
+            $items->push(.int($x as int64));
+        }
+        return .list($items);
+    }
+
+    #[implicit]
+    public static function from(array<float64> $v) : Value
+    {
+        array<Value> $items = arr::room<Value>($v->count());
+        foreach ($v as $f) {
+            $items->push(.float($f));
+        }
+        return .list($items);
+    }
+
+    #[implicit]
+    public static function from(array<string> $v) : Value
+    {
+        array<Value> $items = arr::room<Value>($v->count());
+        foreach ($v as $s) {
+            $items->push(.text($s));
+        }
+        return .list($items);
+    }
+
+    #[implicit]
+    public static function from(array<bool> $v) : Value
+    {
+        array<Value> $items = arr::room<Value>($v->count());
+        foreach ($v as $b) {
+            $items->push(.bool($b));
+        }
+        return .list($items);
+    }
+
+    #[implicit]
+    public static function from(array<Value> $v) : Value
+    {
+        return .list($v);
+    }
+
+    /**
+     * True when this is SQL NULL.
+     */
+    public const function isNull() : bool
+    {
+        return match ($this) {
+            Value::none => true,
+            else => false,
+        };
+    }
+
+    public const function bool() : bool?
+    {
+        return match ($this) {
+            Value::bool($v) => $v,
+            else => null,
+        };
+    }
+
+    /**
+     * An integer.
+     */
+    public const function int() : int64?
+    {
+        return match ($this) {
+            Value::int($v) => $v,
+            else => null,
+        };
+    }
+
+    /**
+     * A float, or any number: an integer, or a numeric parsed (and rounded) to a float.
+     */
+    public const function float() : float64?
+    {
+        return match ($this) {
+            Value::float($v) => $v,
+            Value::int($v) => $v as float64,
+            Value::numeric($v) => str::float($v),
+            else => null,
+        };
+    }
+
+    /**
+     * A NUMERIC as the server wrote it, or an integer in decimal.
+     */
+    public const function numeric() : string?
+    {
+        return match ($this) {
+            Value::numeric($v) => $v,
+            Value::int($v) => str::from($v),
+            else => null,
+        };
+    }
+
+    /**
+     * Text, a numeric as written, or JSON as text.
+     */
+    public const function text() : string?
+    {
+        return match ($this) {
+            Value::text($v) => $v,
+            Value::numeric($v) => $v,
+            Value::json($v) => $v,
+            else => null,
+        };
+    }
+
+    /**
+     * Bytes, or text as its bytes.
+     */
+    public const function bytes() : string?
+    {
+        return match ($this) {
+            Value::bytes($v) => $v,
+            Value::text($v) => $v,
+            else => null,
+        };
+    }
+
+    /**
+     * JSON or JSONB as text.
+     */
+    public const function json() : string?
+    {
+        return match ($this) {
+            Value::json($v) => $v,
+            else => null,
+        };
+    }
+
+    public const function uuid() : Uuid?
+    {
+        return match ($this) {
+            Value::uuid($v) => $v,
+            else => null,
+        };
+    }
+
+    public const function date() : Date?
+    {
+        return match ($this) {
+            Value::date($v) => $v,
+            else => null,
+        };
+    }
+
+    public const function time() : Time?
+    {
+        return match ($this) {
+            Value::time($v) => $v,
+            else => null,
+        };
+    }
+
+    /**
+     * A TIMESTAMP or a TIMESTAMPTZ (in UTC), or a DATE at midnight.
+     */
+    public const function datetime() : DateTime?
+    {
+        return match ($this) {
+            Value::timestamp($v) => $v,
+            Value::timestamptz($v) => $v,
+            Value::date($v) => DateTime(midnight: $v),
+            else => null,
+        };
+    }
+
+    public const function interval() : Interval?
+    {
+        return match ($this) {
+            Value::interval($v) => $v,
+            else => null,
+        };
+    }
+
+    /**
+     * An array's elements.
+     */
+    public const function list() : array<Value>?
+    {
+        return match ($this) {
+            Value::list($v) => $v,
+            else => null,
+        };
+    }
+
+    /**
+     * The case's name: `none`, `int`, `timestamptz` and so on. For a log line or a test.
+     */
+    public const function kind() : string
+    {
+        return match ($this) {
+            Value::none => 'none',
+            Value::bool($v) => 'bool',
+            Value::int($v) => 'int',
+            Value::float($v) => 'float',
+            Value::numeric($v) => 'numeric',
+            Value::text($v) => 'text',
+            Value::bytes($v) => 'bytes',
+            Value::json($v) => 'json',
+            Value::uuid($v) => 'uuid',
+            Value::date($v) => 'date',
+            Value::time($v) => 'time',
+            Value::timestamp($v) => 'timestamp',
+            Value::timestamptz($v) => 'timestamptz',
+            Value::interval($v) => 'interval',
+            Value::list($v) => 'list',
+        };
+    }
+}

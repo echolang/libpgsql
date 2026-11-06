@@ -1,0 +1,227 @@
+namespace pgsql;
+
+#[docs::see: ["pgsql::RowView"]]
+
+/**
+ * A result read one row at a time, for results too big to hold. While it is open the connection
+ * answers `.busy`; reaching the end, `finish()`, or dropping it frees the connection again.
+ * `next()` (or `foreach`) hands out each row decoded whole; `step()` with `view()` reads in place.
+ *
+ * ```echo
+ * pgsql::Rows $s = guard $db->stream('SELECT name FROM t');
+ * foreach ($s as $row) {
+ *     echo $row['name'];
+ * }
+ * ```
+ */
+public class Rows : contract::iterable<Row>
+{
+    private Connection $db;
+    private tcp::Deadline $by;
+    // rows remain in the result
+    private bool $open;
+    private Error? $failure;
+    private RowView $view;
+
+    internal constructor(Connection $db, Columns $columns, tcp::Deadline $by, bool $open)
+    {
+        $this->db = $db;
+        $this->by = $by;
+        $this->open = $open;
+        $this->failure = null;
+        $this->view = RowView($columns);
+        $db->busy = $open;
+    }
+
+    destructor()
+    {
+        status<Error> $done = $this->finish();
+    }
+
+    public const function columns() : Columns
+    {
+        return $this->view->columns;
+    }
+
+    /**
+     * How the result ended: its command tag and row count. Read it once the rows are done.
+     */
+    public const function outcome() : Outcome
+    {
+        return $this->db->ending;
+    }
+
+    /**
+     * Move to the next row. True when there is one, then readable through `view()`. False at the
+     * end.
+     */
+    public function step() : result<bool, Error>
+    {
+        string::view? $got = guard $this->following() else ($e) {
+            return .error($e);
+        }
+        string::view $packet = guard $got else {
+            return .ok(false);
+        }
+        guard $this->view->load($packet) else ($e) {
+            $this->stop($e);
+            return .error($e);
+        }
+        return .ok(true);
+    }
+
+    /**
+     * The row the last `step()` moved to, read in place. Holds until the next move. After the last
+     * row, and after a `next()` (which decodes without the view), it has no values.
+     */
+    public const function view() : const RowView&
+    {
+        return $this->view;
+    }
+
+    /**
+     * The next row, decoded whole, or null at the end.
+     */
+    public function next() : result<Row?, Error>
+    {
+        string::view? $got = guard $this->following() else ($e) {
+            return .error($e);
+        }
+        string::view $packet = guard $got else {
+            return .ok(null);
+        }
+        // decoded in the one walk that finds its values: the view is not laid out for it
+        Row $row = guard Row::read($packet, $this->view->columns) else ($e) {
+            $this->stop($e);
+            return .error($e);
+        }
+        return .ok($row);
+    }
+
+    /**
+     * The next row, in place until the next move, or null at the end. The common case, the row
+     * already here, reads nothing.
+     */
+    internal function following() : result<string::view?, Error>
+    {
+        string::view? $got = $this->arrived();
+        if ($got != null) {
+            return .ok($got);
+        }
+        return $this->move();
+    }
+
+    /**
+     * The next row when it is already here, with the view moved off the last row. Null when
+     * `move` has to look.
+     */
+    internal function arrived() : string::view?
+    {
+        if (!$this->open) {
+            return null;
+        }
+        $this->view->leave();
+        return $this->db->channel->row();
+    }
+
+    /**
+     * The next row, in place until the next move, or null at the end. At the end the command's
+     * ReadyForQuery is read too, so the connection is free.
+     */
+    internal function move() : result<string::view?, Error>
+    {
+        string::view? $none = null;
+        $this->view->leave();
+        if (!$this->open) {
+            return .ok($none);
+        }
+        string::view? $got = guard $this->db->packet($this->by) else ($e) {
+            $this->stop($e);
+            return .error($e);
+        }
+        if ($got == null) {
+            $this->open = false;
+            guard $this->db->drain($this->by) else ($e) {
+                $this->stop($e);
+                return .error($e);
+            }
+            $this->db->busy = false;
+        }
+        return .ok($got);
+    }
+
+    /**
+     * Read and drop whatever is left, so the connection is free. Reports the error a `foreach`
+     * over these rows could not hand back.
+     */
+    public function finish() : status<Error>
+    {
+        // the rest is dropped unread: each row only found, nothing decoded
+        while ($this->open) {
+            if ($this->following()->failed()) {
+                break;
+            }
+        }
+        Error $e = guard $this->failure else {
+            return .ok;
+        }
+        return .error($e);
+    }
+
+    public function iterate() : RowsCursor
+    {
+        return RowsCursor($this, Row($this->view->columns, RowData()));
+    }
+
+    /**
+     * A failure ends the stream. A server error has already read on to the end of the command; a
+     * timeout cancelled it; anything else closed the connection.
+     */
+    internal function stop(Error $e) : void
+    {
+        if ($this->failure == null) {
+            $this->failure = $e;
+        }
+        $this->open = false;
+        $this->db->busy = false;
+        $this->db->abandon($e);
+    }
+}
+
+/**
+ * What `foreach` walks `Rows` with: one `Row`, loaded with each row in turn. A loop that does not
+ * keep its rows allocates nothing for them. A failure stops the loop; `Rows::finish` reports it.
+ */
+public struct RowsCursor : contract::iterator<Row>
+{
+    internal Rows $rows;
+    internal Row $row;
+
+    /**
+     * Load the next row. False at the end, or after a failure `finish` will report.
+     */
+    public function advance() : bool
+    {
+        result<string::view?, Error> $next = $this->rows->following();
+        if ($next->failed()) {
+            return false;
+        }
+        string::view $packet = guard $next->unwrap() else {
+            return false;
+        }
+        status<Error> $loaded = $this->row->load($packet);
+        if ($loaded->failed()) {
+            $this->rows->stop($loaded->failure());
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * The row `advance` just loaded. Reused across iterations.
+     */
+    public function current() : Row&
+    {
+        return $this->row;
+    }
+}

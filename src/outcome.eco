@@ -1,0 +1,47 @@
+namespace pgsql;
+
+/**
+ * What a statement did: the rows it touched (or returned, or copied) and its command tag. No
+ * insert id: PostgreSQL hands those back through `RETURNING`.
+ */
+public struct Outcome
+{
+    /**
+     * Rows inserted, updated, deleted, selected, fetched, moved or copied. Zero for a command that
+     * counts none (`CREATE TABLE`, `BEGIN`).
+     */
+    public const uint64 $affectedRows = 0;
+
+    /**
+     * The command tag's first word: `INSERT`, `UPDATE`, `SELECT`, `CREATE`, `COPY`. Empty for an
+     * empty query.
+     */
+    public const string $command = '';
+
+    // the transaction status the server reported after it: I, T or E
+    internal const uint8 $status = 73;
+
+    /**
+     * True when a transaction is open after this statement, failed or not.
+     */
+    public const function inTransaction() : bool
+    {
+        return $this->status != pgsql::protocol::IDLE;
+    }
+
+    /**
+     * True when the open transaction has failed: it only takes ROLLBACK now.
+     */
+    public const function failed() : bool
+    {
+        return $this->status == pgsql::protocol::FAILED;
+    }
+
+    /**
+     * The same outcome, with the transaction status that followed it.
+     */
+    internal const function settled(uint8 $status) : Outcome
+    {
+        return Outcome($this->affectedRows, $this->command, $status);
+    }
+}

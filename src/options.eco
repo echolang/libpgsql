@@ -1,0 +1,498 @@
+namespace pgsql;
+
+use std::time;
+
+/**
+ * Whether to ask the server for TLS. This client has no TLS yet: `disable`, `allow` and `prefer`
+ * all connect in plain, the way libpq does against a server without TLS, and the modes that
+ * insist on it are refused at `open`.
+ */
+public enum SslMode
+{
+    case disable;
+    case allow;
+    case prefer;
+    case require;
+    case verifyCa;
+    case verifyFull;
+
+    /**
+     * The mode libpq calls `$name` (`verify-full`), or null when there is none.
+     */
+    public static function named(const string& $name) : SslMode?
+    {
+        if ($name == 'disable') {
+            return SslMode::disable;
+        }
+        if ($name == 'allow') {
+            return SslMode::allow;
+        }
+        if ($name == 'prefer') {
+            return SslMode::prefer;
+        }
+        if ($name == 'require') {
+            return SslMode::require;
+        }
+        if ($name == 'verify-ca') {
+            return SslMode::verifyCa;
+        }
+        if ($name == 'verify-full') {
+            return SslMode::verifyFull;
+        }
+        return null;
+    }
+
+    /**
+     * True for the modes that refuse a plain connection.
+     */
+    public const function needsTls() : bool
+    {
+        return match ($this) {
+            SslMode::require => true,
+            SslMode::verifyCa => true,
+            SslMode::verifyFull => true,
+            else => false,
+        };
+    }
+}
+
+/**
+ * The newest protocol the client asks for. 3.2 (PostgreSQL 18) brings longer cancel keys; an
+ * older server answers with the version it speaks and the session goes on in that one.
+ */
+public enum Protocol
+{
+    case v3_0;
+    case v3_2;
+
+    internal const function number() : uint32
+    {
+        return match ($this) {
+            Protocol::v3_0 => pgsql::protocol::PROTOCOL_3_0,
+            Protocol::v3_2 => pgsql::protocol::PROTOCOL_3_2,
+        };
+    }
+}
+
+/**
+ * How to reach the server and how to behave once there. Plain data: fields with defaults, set by
+ * name at construction or by assignment.
+ */
+public struct Options
+{
+    public string $host = '127.0.0.1';
+    public uint16 $port = 5432;
+
+    /**
+     * A unix socket: the directory the server puts its socket in (`/var/run/postgresql`, which
+     * gets `.s.PGSQL.{port}` added), or the socket file itself. When set, `host` is not used.
+     */
+    public string? $socket = null;
+
+    public string $user = 'postgres';
+
+    /**
+     * Empty is a password, not "no password". Only sent when the server asks for one.
+     */
+    public string $password = '';
+
+    /**
+     * The database. Null lets the server pick its default: the one named like the user.
+     */
+    public string? $database = null;
+
+    /**
+     * What `pg_stat_activity` shows for the session. Empty sends nothing.
+     */
+    public string $applicationName = '';
+
+    /**
+     * Run-time parameters set at startup, by name: `search_path`, `TimeZone`,
+     * `statement_timeout`. `client_encoding`, `DateStyle` and `extra_float_digits` are this
+     * library's to set: the decoders count on them.
+     */
+    public ordered_map<string, string> $settings = ordered_map<string, string>();
+
+    /**
+     * How long connecting and logging in may take, together.
+     */
+    public time::duration $connectTimeout = time::duration::secs(10);
+
+    /**
+     * How long one command may take when the call names no deadline. Null waits forever.
+     */
+    public time::duration? $timeout = null;
+
+    /**
+     * How long a statement past its deadline gets to answer the cancel request before the
+     * connection is closed instead.
+     */
+    public time::duration $cancelWait = time::duration::secs(2);
+
+    /**
+     * How many prepared statements a connection keeps for SQL it has seen. Zero runs every query
+     * as an unnamed statement: one round trip each time, but rows come back as text.
+     */
+    public usize $statementCache = 64;
+
+    /**
+     * The largest message accepted from the server.
+     */
+    public usize $maxMessage = 67108864;
+
+    public Protocol $protocol = Protocol::v3_0;
+
+    public SslMode $sslmode = SslMode::prefer;
+
+    /**
+     * Send the password in clear text when the server asks for that over TCP. Off by default:
+     * without TLS, anyone in between reads it. A unix socket always may.
+     */
+    public bool $allowCleartext = false;
+
+    /**
+     * Options from a URL: `postgres://user:password@host:port/database?sslmode=disable`, or
+     * `postgresql://`. User, password, host and database are percent-decoded; a host that starts
+     * with `/` is a unix socket directory. Query keys, named as libpq names them: `host`, `port`,
+     * `user`, `password`, `dbname`, `sslmode`, `application_name`, `connect_timeout` (seconds),
+     * `options` (sent as is). And this library's own: `timeout` and `cancel_wait` (`250ms`, `5s`,
+     * `2m`), `statement_cache`, `max_message`, `max_protocol_version` (`3.0` or `3.2`),
+     * `allow_cleartext`.
+     */
+    public static function parse(const string& $url) : result<Options, Error>
+    {
+        Options $o = Options();
+        string $rest = '';
+        if ($url->starts('postgres://')) {
+            $rest = $url->sub(11, $url->size() - 11);
+        } else if ($url->starts('postgresql://')) {
+            $rest = $url->sub(13, $url->size() - 13);
+        } else {
+            return .error(.invalid('a PostgreSQL URL starts with postgres:// or postgresql://'));
+        }
+
+        string $query = '';
+        usize $q = $rest->find('?');
+        if ($q < $rest->size()) {
+            $query = $rest->sub($q + 1, $rest->size() - $q - 1);
+            $rest = $rest->sub(0, $q);
+        }
+
+        string $path = '';
+        usize $slash = $rest->find('/');
+        if ($slash < $rest->size()) {
+            $path = $rest->sub($slash + 1, $rest->size() - $slash - 1);
+            $rest = $rest->sub(0, $slash);
+        }
+        if (!$path->empty()) {
+            string $db = guard unescape($path) else {
+                return .error(.invalid('the database name is not valid percent-encoding'));
+            }
+            $o->database = $db;
+        }
+
+        // the last '@' ends the user info, so an unescaped '@' in the password still works
+        usize $at = lastOf($rest, 64);
+        if ($at < $rest->size()) {
+            string $auth = $rest->sub(0, $at);
+            $rest = $rest->sub($at + 1, $rest->size() - $at - 1);
+            usize $colon = $auth->find(':');
+            string $user = $auth;
+            if ($colon < $auth->size()) {
+                $user = $auth->sub(0, $colon);
+                string $pass = guard unescape($auth->sub($colon + 1, $auth->size() - $colon - 1)) else {
+                    return .error(.invalid('the password is not valid percent-encoding'));
+                }
+                $o->password = $pass;
+            }
+            string $u = guard unescape($user) else {
+                return .error(.invalid('the user is not valid percent-encoding'));
+            }
+            if (!$u->empty()) {
+                $o->user = $u;
+            }
+        }
+
+        if (!$rest->empty()) {
+            string $host = $rest;
+            if ($rest->starts('[')) {
+                usize $close = $rest->find(']');
+                if ($close == $rest->size()) {
+                    return .error(.invalid('an IPv6 host without its closing bracket'));
+                }
+                $host = $rest->sub(1, $close - 1);
+                string $after = $rest->sub($close + 1, $rest->size() - $close - 1);
+                if (!$after->empty()) {
+                    if (!$after->starts(':')) {
+                        return .error(.invalid("'{$after}' after the host"));
+                    }
+                    uint16 $p6 = guard port($after->sub(1, $after->size() - 1)) else ($e) {
+                        return .error($e);
+                    }
+                    $o->port = $p6;
+                }
+            } else {
+                usize $colon = $rest->find(':');
+                if ($colon < $rest->size()) {
+                    $host = $rest->sub(0, $colon);
+                    uint16 $p = guard port($rest->sub($colon + 1, $rest->size() - $colon - 1)) else ($e) {
+                        return .error($e);
+                    }
+                    $o->port = $p;
+                }
+            }
+            if ($host->contains(',')) {
+                return .error(.invalid('several hosts in one URL are not supported'));
+            }
+            string $h = guard unescape($host) else {
+                return .error(.invalid('the host is not valid percent-encoding'));
+            }
+            guard $o->option('host', $h) else ($e) {
+                return .error($e);
+            }
+        }
+
+        if (!$query->empty()) {
+            foreach (str::split($query, '&')->owned() as $pair) {
+                if ($pair->empty()) {
+                    continue;
+                }
+                usize $eq = $pair->find('=');
+                string $key = $pair;
+                string $raw = '';
+                if ($eq < $pair->size()) {
+                    $key = $pair->sub(0, $eq);
+                    $raw = $pair->sub($eq + 1, $pair->size() - $eq - 1);
+                }
+                string $value = guard unescape($raw) else {
+                    return .error(.invalid("the value of '{$key}' is not valid percent-encoding"));
+                }
+                guard $o->option($key, $value) else ($e) {
+                    return .error($e);
+                }
+            }
+        }
+        return .ok($o);
+    }
+
+    /**
+     * The path of the unix socket to connect to, or null for TCP.
+     */
+    internal const function socketPath() : string?
+    {
+        string $dir = guard $this->socket else {
+            return null;
+        }
+        // a path that names the socket file itself is taken as it is
+        usize $base = lastOf($dir, 47) + 1;
+        if ($base > $dir->size()) {
+            $base = 0;
+        }
+        if ($dir->sub($base, $dir->size() - $base)->starts('.s.PGSQL.')) {
+            string? $file = $dir;
+            return $file;
+        }
+        string $out = $dir;
+        if (!$out->ends('/')) {
+            $out->push(47);
+        }
+        $out->append(".s.PGSQL.{$this->port}");
+        string? $joined = $out;
+        return $joined;
+    }
+
+    /**
+     * Set one option by its URL name.
+     */
+    private function option(const string& $key, const string& $value) : status<Error>
+    {
+        if ($key == 'host') {
+            if ($value->starts('/')) {
+                $this->socket = $value;
+            } else if (!$value->empty()) {
+                $this->host = $value;
+            }
+            return .ok;
+        }
+        if ($key == 'port') {
+            uint16 $p = guard port($value) else ($e) {
+                return .error($e);
+            }
+            $this->port = $p;
+            return .ok;
+        }
+        if ($key == 'user') {
+            $this->user = $value;
+            return .ok;
+        }
+        if ($key == 'password') {
+            $this->password = $value;
+            return .ok;
+        }
+        if ($key == 'dbname') {
+            $this->database = $value;
+            return .ok;
+        }
+        if ($key == 'application_name') {
+            $this->applicationName = $value;
+            return .ok;
+        }
+        if ($key == 'options') {
+            $this->settings['options'] = $value;
+            return .ok;
+        }
+        if ($key == 'sslmode') {
+            SslMode $m = guard SslMode::named($value) else {
+                return .error(.invalid("sslmode '{$value}' is not disable, allow, prefer, require, verify-ca or verify-full"));
+            }
+            $this->sslmode = $m;
+            return .ok;
+        }
+        if ($key == 'connect_timeout') {
+            // libpq counts whole seconds here; a unit is accepted too
+            time::duration $c = guard duration($value) else {
+                return .error(.invalid("connect_timeout '{$value}' is not a duration like 10, 500ms or 5s"));
+            }
+            $this->connectTimeout = $c;
+            return .ok;
+        }
+        if ($key == 'timeout') {
+            time::duration $t = guard duration($value) else {
+                return .error(.invalid("timeout '{$value}' is not a duration like 500ms or 5s"));
+            }
+            $this->timeout = $t;
+            return .ok;
+        }
+        if ($key == 'cancel_wait') {
+            time::duration $w = guard duration($value) else {
+                return .error(.invalid("cancel_wait '{$value}' is not a duration like 500ms or 5s"));
+            }
+            $this->cancelWait = $w;
+            return .ok;
+        }
+        if ($key == 'statement_cache' || $key == 'max_message') {
+            uint64 $n = guard str::uint($value) else {
+                return .error(.invalid("{$key} is a number, not '{$value}'"));
+            }
+            if ($key == 'statement_cache') {
+                $this->statementCache = $n as usize;
+            } else {
+                if ($n < 1024) {
+                    return .error(.invalid("max_message {$n} is under the 1024 bytes a login needs"));
+                }
+                $this->maxMessage = $n as usize;
+            }
+            return .ok;
+        }
+        if ($key == 'max_protocol_version') {
+            if ($value == '3.0') {
+                $this->protocol = Protocol::v3_0;
+            } else if ($value == '3.2' || $value == 'latest') {
+                $this->protocol = Protocol::v3_2;
+            } else {
+                return .error(.invalid("max_protocol_version is 3.0 or 3.2, not '{$value}'"));
+            }
+            return .ok;
+        }
+        if ($key == 'allow_cleartext') {
+            bool $c = guard flag($value) else {
+                return .error(.invalid("allow_cleartext is true or false, not '{$value}'"));
+            }
+            $this->allowCleartext = $c;
+            return .ok;
+        }
+        return .error(.invalid("unknown option '{$key}'"));
+    }
+}
+
+/**
+ * `%XX` escapes decoded, or null when one is broken.
+ */
+internal function unescape(const string& $s) : string?
+{
+    string $out = '';
+    usize $i = 0;
+    while ($i < $s->size()) {
+        uint8 $c = $s->byte($i);
+        if ($c != 37) {
+            $out->push($c);
+            $i = $i + 1;
+            continue;
+        }
+        if ($i + 2 >= $s->size()) {
+            return null;
+        }
+        string $b = guard crypto::unhex($s->sub($i + 1, 2)) else {
+            return null;
+        }
+        $out->push($b->byte(0));
+        $i = $i + 3;
+    }
+    string? $done = $out;
+    return $done;
+}
+
+/**
+ * The position of the last byte `$b` in `$s`, or its size when there is none.
+ */
+internal function lastOf(const string& $s, uint8 $b) : usize
+{
+    usize $at = $s->size();
+    usize $i = 0;
+    while ($i < $s->size()) {
+        if ($s->byte($i) == $b) {
+            $at = $i;
+        }
+        $i = $i + 1;
+    }
+    return $at;
+}
+
+internal function port(const string& $text) : result<uint16, Error>
+{
+    uint64 $n = guard str::uint($text) else {
+        return .error(.invalid("port '{$text}' is not a number"));
+    }
+    if ($n == 0 || $n > 65535) {
+        return .error(.invalid("port {$n} is not 1..65535"));
+    }
+    return .ok($n as uint16);
+}
+
+/**
+ * `250ms`, `5s` or `2m`, or a bare number of seconds.
+ */
+internal function duration(const string& $text) : time::duration?
+{
+    string $digits = $text;
+    int64 $scale = 1000;
+    if ($text->ends('ms')) {
+        $digits = $text->sub(0, $text->size() - 2);
+        $scale = 1;
+    } else if ($text->ends('s')) {
+        $digits = $text->sub(0, $text->size() - 1);
+    } else if ($text->ends('m')) {
+        $digits = $text->sub(0, $text->size() - 1);
+        $scale = 60000;
+    }
+    int64 $n = guard str::int($digits) else {
+        return null;
+    }
+    // too long to count in milliseconds: refused rather than wrapped round
+    if ($n < 0 || $n > 9223372036854775807 / $scale) {
+        return null;
+    }
+    time::duration? $d = time::duration::millis($n * $scale);
+    return $d;
+}
+
+internal function flag(const string& $text) : bool?
+{
+    if ($text == 'true' || $text == '1') {
+        return true;
+    }
+    if ($text == 'false' || $text == '0') {
+        return false;
+    }
+    return null;
+}

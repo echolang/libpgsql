@@ -1,0 +1,16 @@
+namespace pgsql::auth;
+
+/**
+ * The md5 answer: `md5` and the hex of md5(hex(md5(password, user)), salt). Deprecated by
+ * PostgreSQL 18, still what older roles have.
+ */
+internal function md5(const string& $user, const string& $password, const string& $salt) : string
+{
+    string $inner = $password;
+    $inner->append($user);
+    string $outer = crypto::hex(crypto::md5($inner));
+    $outer->append($salt);
+    string $out = 'md5';
+    $out->append(crypto::hex(crypto::md5($outer)));
+    return $out;
+}

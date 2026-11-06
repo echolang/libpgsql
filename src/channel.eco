@@ -1,0 +1,272 @@
+/**
+ * The message layer: a type byte, a 4-byte length, then the body, over one TCP or unix stream.
+ * Outgoing messages gather in `out` and leave in one write. Incoming messages are read in place.
+ * The ones that may arrive at any time (notices, parameter changes, notifications) are taken care
+ * of here and never reach the caller. Any failure leaves the channel broken: a partly read or
+ * written message leaves no way back to a message boundary.
+ */
+
+namespace pgsql;
+
+use pgsql::protocol::{Message, HEADER, DATA_ROW, NOTICE, PARAMETER_STATUS, NOTIFICATION};
+
+internal class Channel
+{
+    private tcp::Stream $stream;
+    private tcp::Reader $reader;
+    private usize $maxMessage;
+    private bool $broken;
+    // the message `next` last handed out in place: still in the reader, skipped by the next read
+    private usize $lent;
+
+    /**
+     * Messages waiting for `send`.
+     */
+    internal string $out;
+
+    /**
+     * The run-time parameters the server reported, by name: `server_version`, `TimeZone`,
+     * `integer_datetimes` and the rest, kept current as they change.
+     */
+    internal ordered_map<string, string> $settings;
+
+    /**
+     * Who hears about notices and warnings, if anyone does.
+     */
+    internal function<void(ServerError)>? $onNotice;
+
+    internal constructor(tcp::Stream $stream, usize $maxMessage)
+    {
+        $this->stream = $stream;
+        $this->reader = tcp::Reader(max: $maxMessage + HEADER);
+        $this->maxMessage = $maxMessage;
+        $this->broken = false;
+        $this->lent = 0;
+        $this->out = '';
+        $this->settings = ordered_map<string, string>();
+        $this->onNotice = null;
+    }
+
+    internal const function alive() : bool
+    {
+        return !$this->broken && !$this->stream->closed();
+    }
+
+    /**
+     * True when the peer is a unix socket.
+     */
+    internal const function local() : bool
+    {
+        return $this->stream->peer->family == tcp::Family::unix;
+    }
+
+    /**
+     * Write what `out` holds, in one go.
+     */
+    internal function send(tcp::Deadline $by) : status<Error>
+    {
+        if (!$this->alive()) {
+            $this->out->clear();
+            return .error(.closed);
+        }
+        if ($this->out->empty()) {
+            return .ok;
+        }
+        status<tcp::Error> $sent = $this->stream->write($this->out, $by);
+        $this->out->clear();
+        guard $sent else ($e) {
+            return .error($this->fail($e));
+        }
+        return .ok;
+    }
+
+    /**
+     * The next message for the caller, read in place: valid until the next read. Notices,
+     * parameter changes and notifications are dealt with on the way.
+     */
+    internal function next(tcp::Deadline $by) : result<Message, Error>
+    {
+        while (true) {
+            Message $m = guard $this->raw($by) else ($e) {
+                return .error($e);
+            }
+            if ($m->type == NOTICE || $m->type == PARAMETER_STATUS || $m->type == NOTIFICATION) {
+                guard $this->aside($m) else ($e) {
+                    return .error($e);
+                }
+                continue;
+            }
+            return .ok($m);
+        }
+    }
+
+    /**
+     * The next DataRow's body in place, only when the whole message is already buffered. Null
+     * means call `next`. No `result` to unwrap, which is the point of every row of a result.
+     */
+    internal function row() : string::view?
+    {
+        if ($this->broken) {
+            return null;
+        }
+        $this->release();
+        usize $size = $this->framed();
+        if ($size == 0) {
+            return null;
+        }
+        string::view $all = $this->reader->window($size);
+        if ($all->byte(0) != DATA_ROW) {
+            return null;
+        }
+        $this->lent = $size;
+        return $all->sub(HEADER, $size - HEADER);
+    }
+
+    /**
+     * The size of the next message, type byte included, when the whole of it is already buffered
+     * and its length is sound. 0 otherwise: `raw` reads on and judges the length.
+     */
+    private function framed() : usize
+    {
+        usize $have = $this->reader->buffered();
+        if ($have < HEADER) {
+            return 0;
+        }
+        usize $len = tcp::wire::be32($this->reader->window(HEADER), 1) as usize;
+        if ($len < 4 || $len - 4 > $this->maxMessage || $have - 1 < $len) {
+            return 0;
+        }
+        return 1 + $len;
+    }
+
+    /**
+     * The next message, whatever its type.
+     */
+    private function raw(tcp::Deadline $by) : result<Message, Error>
+    {
+        if (!$this->alive()) {
+            return .error(.closed);
+        }
+        $this->release();
+        // most messages arrive with others in the same read: look at what is here first
+        usize $size = $this->framed();
+        if ($size > 0) {
+            string::view $all = $this->reader->window($size);
+            $this->lent = $size;
+            return .ok(Message($all->byte(0), $all->sub(HEADER, $size - HEADER)));
+        }
+        bool $head = guard $this->reader->ensure($this->stream, HEADER, $by) else ($e) {
+            return .error($this->fail($e));
+        }
+        if (!$head) {
+            // what arrived stays buffered, so a later read picks up where this one stopped
+            return .error(.timeout);
+        }
+        string::view $h = $this->reader->window(HEADER);
+        uint8 $type = $h->byte(0);
+        usize $len = tcp::wire::be32($h, 1) as usize;
+        if ($len < 4) {
+            $this->close();
+            return .error(.malformed("a message length of {$len}"));
+        }
+        if ($len - 4 > $this->maxMessage) {
+            $this->close();
+            return .error(.tooLarge(($len - 4) as uint64));
+        }
+        bool $body = guard $this->reader->ensure($this->stream, 1 + $len, $by) else ($e) {
+            return .error($this->fail($e));
+        }
+        if (!$body) {
+            return .error(.timeout);
+        }
+        $this->lent = 1 + $len;
+        return .ok(Message($type, $this->reader->window(1 + $len)->sub(HEADER, $len - 4)));
+    }
+
+    /**
+     * A message that may arrive between any two others.
+     */
+    private function aside(const Message& $m) : status<Error>
+    {
+        if ($m->type == PARAMETER_STATUS) {
+            pgsql::protocol::Setting $s = guard pgsql::protocol::parameterStatus($m->body) else ($e) {
+                $this->close();
+                return .error($e);
+            }
+            $this->settings[$s->name] = $s->value;
+            return .ok;
+        }
+        if ($m->type == NOTICE) {
+            function<void(ServerError)>? $hook = $this->onNotice;
+            if ($hook != null) {
+                function<void(ServerError)> $h = guard $hook;
+                $h(pgsql::protocol::serverError($m->body));
+            }
+            return .ok;
+        }
+        // a NotificationResponse: LISTEN is not offered yet, so nobody is waiting for one
+        return .ok;
+    }
+
+    /**
+     * The settings the server reported, one by name.
+     */
+    internal const function setting(const string& $name) : string?
+    {
+        if (!$this->settings->has($name)) {
+            return null;
+        }
+        string? $v = $this->settings->get($name);
+        return $v;
+    }
+
+    internal function close() : void
+    {
+        $this->broken = true;
+        $this->stream->close();
+    }
+
+    /**
+     * Close the write side and drain what the server still sends. A polite goodbye.
+     */
+    internal function finish(tcp::Deadline $by) : void
+    {
+        $this->broken = true;
+        guard $this->stream->finish($by) else {
+            return;
+        }
+    }
+
+    /**
+     * Past the message `next` lent out, now that whoever read it has moved on.
+     */
+    private function release() : void
+    {
+        if ($this->lent > 0) {
+            $this->reader->skip($this->lent);
+            $this->lent = 0;
+        }
+    }
+
+    /**
+     * A socket failure as this library's error. The stream is closed: whatever was half sent or
+     * half read cannot be resynchronised.
+     */
+    private function fail(tcp::Error $e) : Error
+    {
+        $this->close();
+        return transportError($e);
+    }
+}
+
+internal function transportError(tcp::Error $e) : Error
+{
+    match ($e) {
+        tcp::Error::timeout => {
+            return .timeout;
+        },
+        else => {
+            return .transport($e);
+        },
+    }
+}

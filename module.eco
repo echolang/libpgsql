@@ -1,0 +1,22 @@
+/*
+ * libpgsql: a PostgreSQL client for Echo.
+ *
+ * The frontend/backend protocol 3.0 (and 3.2) is written in Echo over libtcp: startup,
+ * SCRAM-SHA-256, md5 and cleartext login, the simple and extended query protocols with a
+ * statement cache and binary results, streaming, COPY, pipelining, cancel requests and a
+ * connection pool. Hashes and randomness come from libcrypto. No C, no libpq, no TLS yet.
+ */
+
+#[module: "libpgsql"]
+#[version: "0.1.0"]
+#[epm::license: "MIT"]
+#[epm::description: "a postgresql client for echolang, written in echo over libtcp"]
+
+#[requires: "echolang/libtcp" { version: "^0.2", source: git "https://github.com/echolang/libtcp" }]
+#[requires: "echolang/libcrypto" { version: "^0.3.3", source: git "https://github.com/echolang/libcrypto" }]
+
+#[sources: ["src/*.eco", "src/protocol/*.eco", "src/auth/*.eco"]]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+}
