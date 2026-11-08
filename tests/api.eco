@@ -1,0 +1,251 @@
+/**
+ * The public types on their own, no server: `Params` and how they meet the SQL's placeholders,
+ * what an `Error` says about itself, reading a `Row` and a `ResultSet`, finding columns in narrow
+ * and wide results, and intervals printed the way the server prints them.
+ */
+
+use pgsql::{Params, Value, Error, ServerError, ErrorCode, Interval};
+
+/**
+ * The columns a RowDescription of `$specs` (`name:oid`, text format) describes.
+ */
+internal function described(const array<string>& $specs) : pgsql::Columns
+{
+    pgsql::Columns $c = guard pgsql::protocol::rowDescription(columns($specs)) else ($e) {
+        die("{$e}");
+    }
+    return $c;
+}
+
+/**
+ * A row of `$columns`, its values as text.
+ */
+internal function textRow(const pgsql::Columns& $columns, const array<string>& $values) : pgsql::Row
+{
+    string $packet = dataRow($values);
+    pgsql::Row $r = guard pgsql::Row::read($packet->view(), $columns) else ($e) {
+        die("{$e}");
+    }
+    return $r;
+}
+
+/**
+ * The values `$p` resolves to for `$names` (or `$count` positional values).
+ */
+internal function resolved(const Params& $p, const array<string>& $names, usize $count) : array<Value>
+{
+    array<Value> $v = guard $p->resolve($names, $count) else ($e) {
+        die("{$e}");
+    }
+    return $v;
+}
+
+/**
+ * Why `$p` does not resolve for `$names` (or `$count` positional values).
+ */
+internal function refusal(const Params& $p, const array<string>& $names, usize $count) : string
+{
+    result<array<Value>, Error> $r = $p->resolve($names, $count);
+    if (!$r->failed()) {
+        die('expected the params to be refused');
+    }
+    Error $e = $r->failure();
+    assert($e->name() == 'invalid');
+    return $e->message();
+}
+
+test params_resolve_in_placeholder_order
+{
+    array<string> $none = array<string>();
+    array<Value> $two = [1, 'a'];
+    Params $p = Params::of($two);
+    assert($p->count() == 2);
+    array<Value> $v = resolved($p, $none, 2);
+    assert(($v[0]->int() ?? 0) == 1);
+    assert(($v[1]->text() ?? '') == 'a');
+
+    // a name used in any order resolves in the order the SQL numbered them
+    ordered_map<string, Value> $named = ['b' => 2, 'a' => 1];
+    Params $q = Params::named($named);
+    array<string> $ab = ['a', 'b'];
+    array<Value> $w = resolved($q, $ab, 2);
+    assert(($w[0]->int() ?? 0) == 1);
+    assert(($w[1]->int() ?? 0) == 2);
+
+    // set replaces, and chains
+    Params $r = Params()->set('a', .int(1))->set('a', .int(5));
+    assert($r->count() == 1);
+    array<string> $a = ['a'];
+    assert((resolved($r, $a, 1)[0]->int() ?? 0) == 5);
+
+    // the operators an array or map literal fills Params with
+    Params $s = Params();
+    $s[] = 7;
+    $s[] = Value::none;
+    assert(resolved($s, $none, 2)[1]->isNull());
+    Params $t = Params();
+    $t['a'] = 'x';
+    assert((resolved($t, $a, 1)[0]->text() ?? '') == 'x');
+
+    $s->clear();
+    assert($s->count() == 0);
+    assert(resolved($s, $none, 0)->empty());
+}
+
+test params_that_do_not_fit_the_sql_are_refused
+{
+    array<string> $none = array<string>();
+    array<string> $ab = ['a', 'b'];
+    array<Value> $one = [1];
+    assert(refusal(Params::of($one), $none, 2) == 'the SQL takes 2 values and 1 were given');
+    assert(refusal(Params::of($one), $ab, 2)->contains('use set()'));
+
+    ordered_map<string, Value> $justA = ['a' => 1];
+    assert(refusal(Params::named($justA), $none, 0) == 'named values for SQL without placeholders');
+    assert(refusal(Params::named($justA), $none, 1)->contains('write :name'));
+    assert(refusal(Params::named($justA), $ab, 2) == 'no value for :b');
+
+    ordered_map<string, Value> $typo = ['a' => 1, 'b' => 2, 'c' => 3];
+    assert(refusal(Params::named($typo), $ab, 2) == "':c' is not in the statement");
+
+    Params $mixed = Params::of($one)->set('a', .int(1));
+    assert(refusal($mixed, $ab, 2)->contains('mix add() and set()'));
+}
+
+test errors_say_what_they_are
+{
+    Error $conflict = .server(ServerError(ErrorCode::serializationFailure, 'ERROR', '40001', 'could not serialize access'));
+    assert($conflict->retryable());
+    assert($conflict->is(.serializationFailure));
+    assert(!$conflict->is(.deadlockDetected));
+    assert(($conflict->state() ?? '') == '40001');
+    assert(($conflict->code() ?? ErrorCode::warning) == ErrorCode::serializationFailure);
+    assert($conflict->name() == 'server');
+    assert("{$conflict}" == 'ERROR 40001: could not serialize access');
+
+    Error $deadlock = .server(ServerError(ErrorCode::deadlockDetected, 'ERROR', '40P01', 'deadlock detected'));
+    assert($deadlock->retryable());
+    Error $duplicate = .server(ServerError(ErrorCode::uniqueViolation, 'ERROR', '23505', 'duplicate key'));
+    assert(!$duplicate->retryable());
+
+    // a state this library has no name for keeps its code
+    Error $odd = .server(ServerError(ErrorCode::from(pgsql::sqlstate('XX999')), 'ERROR', 'XX999', 'odd'));
+    assert(($odd->code() ?? ErrorCode::warning)->value() == pgsql::sqlstate('XX999'));
+    assert(($odd->state() ?? '') == 'XX999');
+
+    // the ones that did not come from the server carry no code
+    Error $late = .timeout;
+    assert(!$late->retryable());
+    assert($late->code() == null);
+    assert($late->state() == null);
+    assert($late->server() == null);
+    assert(!$late->is(.queryCanceled));
+
+    array<Error> $all = [.timeout, .closed, .busy, .exhausted, .malformed('x'), .tooLarge(9), .invalid('why'), .auth(.needsSecureTransport), .auth(.unsupported('GSSAPI')), .auth(.scram('bad nonce'))];
+    array<string> $names = ['timeout', 'closed', 'busy', 'exhausted', 'malformed', 'tooLarge', 'invalid', 'auth', 'auth', 'auth'];
+    foreach ($all as $i => const &$e) {
+        assert($e->name() == $names[$i]);
+        assert(!$e->message()->empty());
+    }
+    assert(Error::invalid('why')->message() == 'why');
+    assert(Error::tooLarge(9)->message()->contains('9 bytes'));
+    assert(Error::auth(.unsupported('GSSAPI'))->message()->contains('GSSAPI'));
+    assert(Error::auth(.scram('bad nonce'))->message() == 'SCRAM: bad nonce');
+}
+
+test rows_read_by_name_and_position_and_walk_in_order
+{
+    array<string> $specs = ['id:23', 'name:25', 'note:25'];
+    pgsql::Columns $c = described($specs);
+    assert($c->count() == 3);
+    array<string> $names = $c->names();
+    assert(str::join($names, ',') == 'id,name,note');
+
+    array<string> $one = ['7', 'Lamp', '<NULL>'];
+    pgsql::Row $r = textRow($c, $one);
+    assert($r->count() == 3);
+    assert(($r['id']->int() ?? 0) == 7);
+    assert(($r[1]->text() ?? '') == 'Lamp');
+    assert($r['note']->isNull());
+    assert(($r->get('name')?->text() ?? '') == 'Lamp');
+    assert($r->get('nope') == null);
+
+    string $walked = '';
+    foreach ($r as $name => const &$v) {
+        $walked->append("{$name}={$v};");
+    }
+    assert($walked == 'id=7;name=Lamp;note=NULL;');
+
+    array<string> $two = ['8', 'Desk', 'oak'];
+    array<pgsql::Row> $rows = [$r, textRow($c, $two)];
+    pgsql::ResultSet $rs = pgsql::ResultSet($c, $rows, pgsql::Outcome());
+    assert($rs->count() == 2);
+    assert(!$rs->empty());
+    pgsql::Row $first = guard $rs->first() else {
+        die('no first row');
+    }
+    assert(($first['name']->text() ?? '') == 'Lamp');
+    assert(($rs[1]['note']->text() ?? '') == 'oak');
+    int64 $sum = 0;
+    foreach ($rs as const &$row) {
+        $sum = $sum + ($row['id']->int() ?? 0);
+    }
+    assert($sum == 15);
+
+    array<pgsql::Row> $nothing = array<pgsql::Row>();
+    pgsql::ResultSet $empty = pgsql::ResultSet($c, $nothing, pgsql::Outcome());
+    assert($empty->empty());
+    assert($empty->first() == null);
+}
+
+test columns_are_found_in_narrow_and_wide_results
+{
+    // narrow: names compared by their first bytes, then in full past seven
+    array<string> $narrow = ['created_at:25', 'created_by:25', 'id:23', 'id:23'];
+    pgsql::Columns $n = described($narrow);
+    assert(($n->find('created_at') ?? 9) == 0);
+    assert(($n->find('created_by') ?? 9) == 1);
+    assert($n->find('created_') == null);
+    assert($n->find('i') == null);
+    // a join can return one name twice: the first answers
+    assert(($n->find('id') ?? 9) == 2);
+
+    // wide: past sixteen columns the names are indexed
+    array<string> $specs = array<string>();
+    int32 $i = 0;
+    while ($i < 20) {
+        $specs->push("col{$i}:23");
+        $i = $i + 1;
+    }
+    $specs->push('col3:25');
+    pgsql::Columns $w = described($specs);
+    assert($w->count() == 21);
+    $i = 0;
+    while ($i < 20) {
+        assert(($w->find("col{$i}") ?? 99) == ($i as usize));
+        $i = $i + 1;
+    }
+    assert($w->find('col20') == null);
+    assert($w->at(3)->type == pgsql::PgType::int4);
+    assert(($w->find('col3') ?? 99) == 3);
+}
+
+test intervals_print_the_way_the_server_does
+{
+    // each one as PostgreSQL 18 writes it in its default style
+    assert(str::from(Interval(-14, 3, 1500000)) == '-1 years -2 mons +3 days 00:00:01.5');
+    assert(str::from(Interval(-1, 2, 0)) == '-1 mons +2 days');
+    assert(str::from(Interval(1, -2, -3000000)) == '1 mon -2 days -00:00:03');
+    assert(str::from(Interval(-1, 0, 7200000000)) == '-1 mons +02:00:00');
+    assert(str::from(Interval(0, -1, 0)) == '-1 days');
+    assert(str::from(Interval(-12, 0, 3600000000)) == '-1 years +01:00:00');
+    assert(str::from(Interval(0, 0, -3600000000)) == '-01:00:00');
+    // and each one reads back
+    array<Interval> $all = [Interval(-14, 3, 1500000), Interval(-1, 2, 0), Interval(1, -2, -3000000), Interval(-1, 0, 7200000000)];
+    foreach ($all as const &$i) {
+        Interval $back = guard Interval::parse(str::from($i)) else {
+            die("does not read back: {$i}");
+        }
+        assert(sameInterval($back, $i));
+    }
+}

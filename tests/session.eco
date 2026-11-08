@@ -1,0 +1,389 @@
+/**
+ * The session around the queries, against the scripted server: transactions by hand and by
+ * closure, `reset`, `cancel`, statements given up, outcomes that outlive the next command, a COPY
+ * started in the wrong direction, and what a failed prepare leaves on the server.
+ */
+
+use pgsql::protocol::{PARSE, BIND, DESCRIBE, EXECUTE, SYNC, CLOSE, DATA_ROW, COMMAND_COMPLETE, BIND_COMPLETE, CLOSE_COMPLETE, PARSE_COMPLETE, PARAMETER_DESCRIPTION, NO_DATA, COPY_IN, COPY_OUT, COPY_DATA, COPY_DONE, COPY_FAIL, OID_INT4, OID_INT8};
+
+test transactions_commit_roll_back_and_report_a_failed_one
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->answer('BEGIN', 'BEGIN', 84);
+        $w->answer('COMMIT', 'COMMIT', 73);
+
+        $w->answer('BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY', 'BEGIN', 84);
+        $w->query('SELECT 1/0');
+        $w->error('22012', 'division by zero');
+        $w->ready(69);
+        // a failed transaction answers COMMIT with ROLLBACK
+        $w->answer('COMMIT', 'ROLLBACK', 73);
+
+        $w->answer('BEGIN ISOLATION LEVEL REPEATABLE READ', 'BEGIN', 84);
+        $w->answer('ROLLBACK', 'ROLLBACK', 73);
+
+        // dropped without a commit
+        $w->answer('BEGIN ISOLATION LEVEL READ COMMITTED', 'BEGIN', 84);
+        $w->answer('ROLLBACK', 'ROLLBACK', 73);
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Transaction $a = begun($db->begin());
+    assert($a->open());
+    assert($db->inTransaction());
+    fine($a->commit());
+    assert(!$a->open());
+    assert(!$db->inTransaction());
+    assert(failsStatus($a->commit())->name() == 'invalid');
+    // nothing left to undo
+    fine($a->rollback());
+
+    pgsql::Transaction $b = begun($db->begin(pgsql::Isolation::serializable, $readOnly: true));
+    assert(failsExec($db->exec('SELECT 1/0'))->is(.divisionByZero));
+    assert($db->inTransaction());
+    pgsql::Error $e = failsStatus($b->commit());
+    assert($e->is(.inFailedSqlTransaction));
+    assert(!$b->open());
+    assert(!$db->inTransaction());
+
+    pgsql::Transaction $c = begun($db->begin(pgsql::Isolation::repeatableRead));
+    fine($c->rollback());
+    fine($c->rollback());
+    assert(!$c->open());
+    {
+        pgsql::Transaction $d = begun($db->begin(pgsql::Isolation::readCommitted));
+        assert($d->open());
+    }
+    assert(!$db->inTransaction());
+    $db->close();
+    $f->server->join();
+}
+
+test a_transaction_closure_commits_on_ok_and_rolls_back_on_error
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->answer('BEGIN', 'BEGIN', 84);
+        $w->answer('UPDATE t SET a = 1', 'UPDATE 2', 84);
+        $w->answer('COMMIT', 'COMMIT', 73);
+
+        $w->answer('BEGIN', 'BEGIN', 84);
+        $w->query('UPDATE t SET a = 1/0');
+        $w->error('22012', 'division by zero');
+        $w->ready(69);
+        $w->answer('ROLLBACK', 'ROLLBACK', 73);
+
+        $w->answer('BEGIN', 'BEGIN', 84);
+        $w->answer('UPDATE t SET a = 2', 'UPDATE 5', 84);
+        $w->answer('COMMIT', 'COMMIT', 73);
+
+        // the work fails on this side, with nothing sent: rolled back all the same
+        $w->answer('BEGIN', 'BEGIN', 84);
+        $w->answer('ROLLBACK', 'ROLLBACK', 73);
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    fine($db->transaction(function(pgsql::Connection $c) : status<pgsql::Error> {
+        guard $c->exec('UPDATE t SET a = 1') else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    }));
+    assert(!$db->inTransaction());
+
+    status<pgsql::Error> $failed = $db->transaction(function(pgsql::Connection $c) : status<pgsql::Error> {
+        guard $c->exec('UPDATE t SET a = 1/0') else ($e) {
+            return .error($e);
+        }
+        return .ok;
+    });
+    assert($failed->failure()->is(.divisionByZero));
+    assert(!$db->inTransaction());
+
+    result<uint64, pgsql::Error> $n = $db->transaction<uint64>(function(pgsql::Connection $c) : result<uint64, pgsql::Error> {
+        pgsql::Outcome $o = guard $c->exec('UPDATE t SET a = 2') else ($e) {
+            return .error($e);
+        }
+        return .ok($o->affectedRows);
+    });
+    assert($n->or(0) == 5);
+
+    result<uint64, pgsql::Error> $refused = $db->transaction<uint64>(function(pgsql::Connection $c) : result<uint64, pgsql::Error> {
+        return .error(.invalid('changed my mind'));
+    });
+    assert($refused->failure()->name() == 'invalid');
+    assert(!$db->inTransaction());
+    $db->close();
+    $f->server->join();
+}
+
+test reset_rolls_back_discards_and_prepares_again
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->answer('BEGIN', 'BEGIN', 84);
+        int32 $round = 0;
+        while ($round < 2) {
+            // prepared both times: the reset forgot the first
+            array<Msg> $prep = $w->batch();
+            assert($prep->count() == 3 && $prep[0]->type == PARSE);
+            array<uint32> $types = [OID_INT4];
+            array<string> $one = ['n:23'];
+            $w->describe($types, columns($one));
+            $w->ready(84);
+            assert($w->kinds() == 'BES');
+            $w->send(BIND_COMPLETE, '');
+            array<string> $row = [be32(3)];
+            $w->send(DATA_ROW, dataRow($row));
+            $w->send(COMMAND_COMPLETE, commandComplete('SELECT 1'));
+            if ($round == 0) {
+                $w->ready(84);
+                $w->answer('ROLLBACK', 'ROLLBACK', 73);
+                $w->answer('DISCARD ALL', 'DISCARD ALL', 73);
+            } else {
+                $w->ready(73);
+            }
+            $round = $round + 1;
+        }
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    did($db->exec('BEGIN'));
+    assert(got($db->query('SELECT :n AS n', ['n' => 3]))->count() == 1);
+    fine($db->reset());
+    assert(!$db->inTransaction());
+    assert(got($db->query('SELECT :n AS n', ['n' => 3]))->count() == 1);
+    $db->close();
+    $f->server->join();
+}
+
+test cancel_reaches_the_server_with_the_sessions_key
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        string $key = $w->cancelled();
+        assert(tcp::wire::be32($key, 0) == 4242);
+        assert($key->sub(4, 4) == 'k3y!');
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    assert($db->key->pid == 4242);
+    fine($db->cancel());
+    assert($db->alive());
+    $db->close();
+    assert(!$db->alive());
+    // closing twice is fine, and a closed connection says so
+    $db->close();
+    assert(failsExec($db->exec('SELECT 1'))->name() == 'closed');
+    $f->server->join();
+}
+
+test a_dropped_statement_is_closed_with_the_next_command
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        array<Msg> $prep = $w->batch();
+        string $name = parsed($prep[0]);
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['n:23'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        array<Msg> $next = $w->batch();
+        assert($next->count() == 2);
+        assert($next[0]->type == CLOSE && $next[0]->body->contains($name));
+        $w->send(CLOSE_COMPLETE, '');
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    {
+        pgsql::Statement $st = prepared($db->prepare('SELECT n FROM t'));
+        assert($st->params() == 0);
+        assert($st->columns()->count() == 1);
+        assert($st->columns()->at(0)->name == 'n');
+    }
+    fine($db->ping());
+    $db->close();
+    $f->server->join();
+}
+
+test a_stream_and_a_copy_keep_their_outcome_after_the_next_command
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->batch();
+        array<uint32> $none = array<uint32>();
+        array<string> $one = ['n:23'];
+        $w->describe($none, columns($one));
+        $w->ready();
+        $w->batch();
+        $w->send(BIND_COMPLETE, '');
+        array<string> $row = [be32(1)];
+        $w->send(DATA_ROW, dataRow($row));
+        $w->send(COMMAND_COMPLETE, commandComplete('SELECT 1'));
+        $w->ready();
+        $w->answer('UPDATE t SET a = 1', 'UPDATE 7', 73);
+
+        $w->query('COPY t TO STDOUT');
+        $w->send(COPY_OUT, copyFormat(1));
+        $w->send(COPY_DATA, "1\n");
+        $w->send(COPY_DONE, '');
+        $w->send(COMMAND_COMPLETE, commandComplete('COPY 1'));
+        $w->ready();
+        $w->answer('DELETE FROM t', 'DELETE 9', 73);
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Rows $rows = streamed($db->stream('SELECT n FROM t'));
+    fine($rows->finish());
+    did($db->exec('UPDATE t SET a = 1'));
+    assert($rows->outcome()->command == 'SELECT');
+    assert($rows->outcome()->affectedRows == 1);
+
+    pgsql::CopyOut $out = guard $db->copyOut('COPY t TO STDOUT') else ($e) {
+        die("{$e}");
+    }
+    fine($out->finish());
+    did($db->exec('DELETE FROM t'));
+    assert($out->outcome()->command == 'COPY');
+    assert($out->outcome()->affectedRows == 1);
+    $db->close();
+    $f->server->join();
+}
+
+test a_copy_in_the_wrong_direction_is_refused_and_the_connection_stays
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        // copyIn of a COPY TO: its data is read away
+        $w->query('COPY t TO STDOUT');
+        $w->send(COPY_OUT, copyFormat(1));
+        $w->send(COPY_DATA, "1\n");
+        $w->send(COPY_DONE, '');
+        $w->send(COMMAND_COMPLETE, commandComplete('COPY 1'));
+        $w->ready();
+        // copyOut of a COPY FROM: failed by the client
+        $w->query('COPY t FROM STDIN');
+        $w->send(COPY_IN, copyFormat(1));
+        $w->expect(COPY_FAIL);
+        $w->error('57014', 'COPY from stdin failed');
+        $w->ready();
+        // not a COPY at all
+        $w->query('SELECT 1');
+        array<string> $spec = ['n:23'];
+        array<array<string>> $rows = [['1']];
+        $w->rows(columns($spec), $rows);
+        $w->ready();
+        // the server refuses the COPY
+        $w->query('COPY nope FROM STDIN');
+        $w->error('42P01', 'relation "nope" does not exist');
+        $w->ready();
+        $w->expect(SYNC);
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    assert($db->copyIn('COPY t TO STDOUT')->failure()->name() == 'invalid');
+    assert($db->copyOut('COPY t FROM STDIN')->failure()->name() == 'invalid');
+    assert($db->copyIn('SELECT 1')->failure()->name() == 'invalid');
+    assert($db->copyIn('COPY nope FROM STDIN')->failure()->is(.undefinedTable));
+    fine($db->ping());
+    $db->close();
+    $f->server->join();
+}
+
+test a_copy_in_keeps_the_connection_busy_and_a_dropped_one_is_abandoned
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        $w->answer('BEGIN', 'BEGIN', 84);
+        $w->query('COPY t FROM STDIN');
+        $w->send(COPY_IN, copyFormat(1));
+        // the COPY is dropped: failed, so nothing is copied, its buffered row never sent
+        string $why = $w->expect(COPY_FAIL);
+        assert($why->contains('dropped'));
+        $w->error('57014', 'COPY from stdin failed');
+        $w->ready(69);
+        // the transaction it ran in is rolled back once the connection is free again
+        $w->answer('ROLLBACK', 'ROLLBACK', 73);
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    {
+        pgsql::Transaction $tx = begun($db->begin());
+        {
+            pgsql::CopyIn $in = guard $db->copyIn('COPY t FROM STDIN') else ($e) {
+                die("{$e}");
+            }
+            assert(!$in->binary);
+            assert(failsExec($db->exec('SELECT 1'))->name() == 'busy');
+            // a COPY started from SQL alone takes binary rows only through write()
+            array<pgsql::Value> $r = [1];
+            fine($in->row($r));
+            // the rollback cannot go out while the COPY runs: the transaction stays open
+            assert(failsStatus($tx->rollback())->name() == 'busy');
+            assert($tx->open());
+        }
+        assert($db->inTransaction());
+    }
+    assert(!$db->inTransaction());
+    $db->close();
+    $f->server->join();
+}
+
+test a_pipeline_whose_prepare_fails_leaves_no_statement_behind
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        array<Msg> $prep = $w->batch();
+        assert($prep->count() == 5);
+        string $first = parsed($prep[0]);
+        // the first statement parses, the second does not
+        $w->send(PARSE_COMPLETE, '');
+        array<uint32> $types = [OID_INT8];
+        $w->send(PARAMETER_DESCRIPTION, paramTypes($types));
+        $w->send(NO_DATA, '');
+        $w->error('42601', 'syntax error at or near "BOGUS"');
+        $w->ready();
+        // the first statement is kept: the pipeline again prepares only the second
+        array<Msg> $again = $w->batch();
+        assert($again->count() == 3);
+        assert($again[0]->type == PARSE && parsed($again[0]) != $first);
+        $w->error('42601', 'syntax error at or near "BOGUS"');
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    pgsql::Pipeline $p = $db->pipeline();
+    $p->add('INSERT INTO t VALUES (:id)', ['id' => 1]);
+    $p->add('BOGUS');
+    assert($p->run()->failure()->is(.syntaxError));
+    assert(($p->failedAt() ?? 9) == 1);
+    assert($p->run()->failure()->is(.syntaxError));
+    $db->close();
+    $f->server->join();
+}
+
+test a_statement_whose_parameters_do_not_match_is_closed
+{
+    Fake $f = fake(function(Wire $w) : void {
+        $w->welcome();
+        array<Msg> $prep = $w->batch();
+        string $name = parsed($prep[0]);
+        // two parameters where the SQL names one
+        array<uint32> $two = [OID_INT4, OID_INT4];
+        $w->describe($two, '');
+        $w->ready();
+        array<Msg> $next = $w->batch();
+        assert($next[0]->type == CLOSE && $next[0]->body->contains($name));
+        $w->send(CLOSE_COMPLETE, '');
+        $w->ready();
+        $w->bye();
+    });
+    pgsql::Connection $db = login($f);
+    assert(failsExec($db->exec('UPDATE t SET a = :a', ['a' => 1]))->name() == 'invalid');
+    fine($db->ping());
+    $db->close();
+    $f->server->join();
+}

@@ -64,14 +64,19 @@ internal function dayText(int32 $year, uint8 $month, uint8 $day) : string
 }
 
 /**
- * `3 days`, `1 day`, `-1 days`.
+ * `3 days`, `1 day`, `-1 days`. After a negative part a positive one says so, `+3 days`, the way
+ * the server writes it.
  */
-internal function unit(int64 $n, const string& $one, const string& $many) : string
+internal function unit(int64 $n, const string& $one, const string& $many, bool $afterNegative) : string
 {
-    if ($n == 1) {
-        return "{$n} {$one}";
+    string $sign = '';
+    if ($afterNegative && $n > 0) {
+        $sign = '+';
     }
-    return "{$n} {$many}";
+    if ($n == 1) {
+        return "{$sign}{$n} {$one}";
+    }
+    return "{$sign}{$n} {$many}";
 }
 
 /**
@@ -163,15 +168,15 @@ public function from(const pgsql::Interval& $i) : string
     int64 $mons = ($i->months % 12) as int64;
     bool $negative = false;
     if ($years != 0) {
-        $parts->push(pgsql::unit($years, 'year', 'years'));
+        $parts->push(pgsql::unit($years, 'year', 'years', $negative));
         $negative = $years < 0;
     }
     if ($mons != 0) {
-        $parts->push(pgsql::unit($mons, 'mon', 'mons'));
+        $parts->push(pgsql::unit($mons, 'mon', 'mons', $negative));
         $negative = $mons < 0;
     }
     if ($i->days != 0) {
-        $parts->push(pgsql::unit($i->days as int64, 'day', 'days'));
+        $parts->push(pgsql::unit($i->days as int64, 'day', 'days', $negative));
         $negative = $i->days < 0;
     }
     if ($i->micros != 0 || $parts->empty()) {

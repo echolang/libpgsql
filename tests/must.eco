@@ -85,3 +85,11 @@ internal function failsStatus(status<pgsql::Error> $s) : pgsql::Error
     }
     return $s->failure();
 }
+
+/**
+ * The same months, days and microseconds: `Interval` has no equality of its own.
+ */
+internal function sameInterval(const pgsql::Interval& $a, const pgsql::Interval& $b) : bool
+{
+    return $a->months == $b->months && $a->days == $b->days && $a->micros == $b->micros;
+}

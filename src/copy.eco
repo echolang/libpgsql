@@ -303,6 +303,8 @@ public class CopyOut
     private Connection $db;
     private tcp::Deadline $by;
     private bool $open;
+    // how the COPY ended, kept once it has: the connection moves on to the next command
+    private Outcome $ended;
 
     /**
      * True when the data is in COPY's binary format.
@@ -314,6 +316,7 @@ public class CopyOut
         $this->db = $db;
         $this->by = $by;
         $this->open = true;
+        $this->ended = Outcome();
         $this->binary = $binary;
         $db->busy = true;
     }
@@ -335,25 +338,30 @@ public class CopyOut
         }
         while (true) {
             Message $m = guard $this->db->channel->next($this->by) else ($e) {
+                Error $cut = $this->db->interrupted($e);
                 $this->stop();
-                return .error($this->db->interrupted($e));
+                return .error($cut);
             }
             if ($m->type == pgsql::protocol::COPY_DATA) {
                 string::view? $chunk = $m->body;
                 return .ok($chunk);
             }
             if ($m->type == pgsql::protocol::COPY_DONE) {
+                status<Error> $drained = $this->db->drain($this->by);
                 $this->stop();
-                guard $this->db->drain($this->by) else ($e) {
+                guard $drained else ($e) {
                     return .error($e);
                 }
                 return .ok($none);
             }
-            $this->stop();
             if ($m->type == pgsql::protocol::ERROR) {
-                return .error($this->db->refused($m, $this->by));
+                Error $refused = $this->db->refused($m, $this->by);
+                $this->stop();
+                return .error($refused);
             }
-            return .error($this->db->broken(.malformed("message {$m->type} in a COPY's data")));
+            Error $bad = $this->db->broken(.malformed("message {$m->type} in a COPY's data"));
+            $this->stop();
+            return .error($bad);
         }
     }
 
@@ -362,7 +370,7 @@ public class CopyOut
      */
     public const function outcome() : Outcome
     {
-        return $this->db->ending->settled($this->db->status);
+        return $this->ended;
     }
 
     /**
@@ -378,9 +386,12 @@ public class CopyOut
         return .ok;
     }
 
+    /**
+     * The COPY is over and the connection read on as far as it could: free, its outcome kept.
+     */
     private function stop() : void
     {
         $this->open = false;
-        $this->db->busy = false;
+        $this->ended = $this->db->release();
     }
 }

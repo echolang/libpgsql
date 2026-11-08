@@ -1,0 +1,111 @@
+/**
+ * The session against a real server: statement closes ahead of a simple query, `reset`, intervals
+ * printed and read the way the server does, and what a failed pipeline leaves prepared.
+ */
+
+#[if: pgsql]
+
+/**
+ * How many statements this session holds on the server, asked without preparing one more.
+ */
+internal function held(pgsql::Connection $db) : int64
+{
+    array<pgsql::ResultSet> $sets = gotAll($db->batch('SELECT count(*) AS n FROM pg_prepared_statements'));
+    return $sets[0][0]['n']->int() ?? -1;
+}
+
+#[group: 'live']
+test live_closes_go_out_ahead_of_a_simple_query
+{
+    pgsql::Options $o = liveOptions();
+    $o->statementCache = 1;
+    pgsql::Connection $db = login($o);
+    assert((got($db->query('SELECT :a::int AS a', ['a' => 1]))[0]['a']->int() ?? 0) == 1);
+    // the second statement pushes the first out of the cache: its Close waits for the next command
+    assert((got($db->query('SELECT :b::int AS b', ['b' => 2]))[0]['b']->int() ?? 0) == 2);
+    assert(did($db->exec('SELECT 1'))->command == 'SELECT');
+    assert(held($db) == 1);
+    $db->close();
+}
+
+#[group: 'live']
+test live_reset_forgets_the_session
+{
+    pgsql::Connection $db = live();
+    did($db->exec("CREATE TEMP TABLE scratch (n int); SET application_name = 'before reset'"));
+    pgsql::Statement $st = prepared($db->prepare('SELECT 1 AS one'));
+    assert(got($db->query('SELECT :n::int AS n', ['n' => 1]))->count() == 1);
+    did($db->exec('BEGIN'));
+    assert($db->inTransaction());
+    fine($db->reset());
+    assert(!$db->inTransaction());
+    assert(held($db) == 0);
+    array<pgsql::ResultSet> $gone = gotAll($db->batch("SELECT to_regclass('pg_temp.scratch') IS NULL AS gone, current_setting('application_name') AS app"));
+    assert($gone[0][0]['gone']->bool() ?? false);
+    assert(($gone[0][0]['app']->text() ?? '') != 'before reset');
+    // the cache was emptied with the server's statements: the same SQL is prepared again
+    assert((got($db->query('SELECT :n::int AS n', ['n' => 2]))[0]['n']->int() ?? 0) == 2);
+    // a statement from prepare() went with the reset
+    assert(failsQuery($st->query())->is(.invalidSqlStatementName));
+    $db->close();
+}
+
+#[group: 'live']
+test live_intervals_print_and_read_like_the_server
+{
+    array<pgsql::Interval> $all = [pgsql::Interval(-14, 3, 1500000), pgsql::Interval(-1, 2, 0), pgsql::Interval(1, -2, -3000000), pgsql::Interval(-1, 0, 7200000000), pgsql::Interval(0, 0, 0)];
+    // binary through the statement cache, text through the unnamed statement
+    array<pgsql::Connection> $ways = modes();
+    pgsql::Connection $db = $ways[0];
+    pgsql::Connection $text = $ways[1];
+    foreach ($all as const &$i) {
+        string $mine = str::from($i);
+        // sent in binary, printed by the server
+        pgsql::ResultSet $printed = got($db->query('SELECT (:i)::interval::text AS t, (:i)::interval AS i', ['i' => $i]));
+        assert(($printed[0]['t']->text() ?? '') == $mine);
+        pgsql::Interval $back = guard $printed[0]['i']->interval() else {
+            die('no interval back');
+        }
+        assert(sameInterval($back, $i));
+        // sent as text, read as text
+        pgsql::ResultSet $parsed = got($text->query('SELECT (:i)::interval AS i', ['i' => $i]));
+        pgsql::Interval $read = guard $parsed[0]['i']->interval() else {
+            die("the server's text did not read back: {$mine}");
+        }
+        assert(sameInterval($read, $i));
+    }
+    $text->close();
+    $db->close();
+}
+
+#[group: 'live']
+test live_outcomes_stay_and_a_failed_pipeline_keeps_what_it_prepared
+{
+    pgsql::Connection $db = live();
+    pgsql::Rows $rows = streamed($db->stream('SELECT generate_series(1, 3) AS n'));
+    fine($rows->finish());
+    did($db->exec('SELECT 1, 2'));
+    assert($rows->outcome()->affectedRows == 3);
+
+    pgsql::CopyOut $out = guard $db->copyOut('COPY (SELECT generate_series(1, 4)) TO STDOUT') else ($e) {
+        die("{$e}");
+    }
+    fine($out->finish());
+    did($db->exec('SELECT 1'));
+    assert($out->outcome()->affectedRows == 4);
+
+    // the stream's statement is cached already
+    int64 $before = held($db);
+    pgsql::Pipeline $p = $db->pipeline();
+    $p->add('SELECT :a::int AS a', ['a' => 1]);
+    $p->add('SELEC broken');
+    assert($p->run()->failure()->is(.syntaxError));
+    assert(($p->failedAt() ?? 9) == 1);
+    // the statement that did prepare is kept and used again, nothing else is left behind
+    assert(held($db) == $before + 1);
+    assert((got($db->query('SELECT :a::int AS a', ['a' => 5]))[0]['a']->int() ?? 0) == 5);
+    assert(held($db) == $before + 1);
+    $db->close();
+}
+
+#[end]

@@ -207,6 +207,7 @@ public class Pipeline
             Prepared $p = guard $db->described($distinct[$slot]->name, $parsed[$k], $by) else ($e) {
                 // the first entry that runs this statement is the one that failed
                 $this->failed = $owner[$k];
+                $this->salvage($distinct, $missing, $owner, $k);
                 return .error($e);
             }
             $distinct[$slot] = $p;
@@ -214,11 +215,26 @@ public class Pipeline
         guard $db->settle($by) else ($e) {
             return .error($e);
         }
-        // kept in `$distinct` as well as in the cache: a statement the cache gives up here is only
-        // closed with the next command, after this pipeline has run it
-        foreach ($missing as $k => $slot) {
-            $db->remember($this->entries[$owner[$k]]->sql, $distinct[$slot]);
-        }
+        $this->salvage($distinct, $missing, $owner, $missing->count());
         return .ok;
+    }
+
+    /**
+     * The statements prepared together, described up to `$failed` (all of them when none
+     * failed). The ones before it are on the server and go into the cache, kept in `$distinct`
+     * as well: a statement the cache gives up here is only closed with the next command, after
+     * this pipeline has run it. The ones after it may be on the server (a refusal on this side
+     * leaves them parsed), so they are closed ahead of the next command. Closing one the server
+     * never made is no error.
+     */
+    private function salvage(const array<Prepared>& $distinct, const array<usize>& $missing, const array<usize>& $owner, usize $failed) : void
+    {
+        foreach ($missing as $k => $slot) {
+            if ($k < $failed) {
+                $this->db->remember($this->entries[$owner[$k]]->sql, $distinct[$slot]);
+            } else if ($k > $failed) {
+                $this->db->closing->push($distinct[$slot]->name);
+            }
+        }
     }
 }

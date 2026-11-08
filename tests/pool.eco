@@ -13,6 +13,7 @@ internal struct Seen
     internal usize $logins = 0;
     internal usize $rollbacks = 0;
     internal usize $quits = 0;
+    internal usize $pings = 0;
 }
 
 #[atomic]
@@ -92,6 +93,10 @@ internal class Many
                 return;
             }
             if ($m->type == SYNC) {
+                {
+                    thread::locked<Seen> $s = $this->seen->lock();
+                    $s->value->pings = $s->value->pings + 1;
+                }
                 $w->ready($status);
                 continue;
             }
@@ -109,6 +114,12 @@ internal class Many
                 } else if ($m->body->starts('COMMIT')) {
                     $status = 73;
                     $w->send(COMMAND_COMPLETE, commandComplete('COMMIT'));
+                } else if ($m->body->starts('HANGUP')) {
+                    // answered, then the server goes away while the connection sits idle
+                    $w->send(COMMAND_COMPLETE, commandComplete('UPDATE 1'));
+                    $w->ready($status);
+                    $w->s->close();
+                    return;
                 } else if ($m->body->starts('FAIL')) {
                     $w->error('22012', 'division by zero');
                     if ($status == 84) {
@@ -215,5 +226,121 @@ test a_closed_pool_lends_nothing
     pgsql::Pool $p = $m->pool(limits(2, 500));
     $p->close();
     assert($p->acquire()->failure()->name() == 'closed');
+    $m->l->close();
+}
+
+test surplus_idle_connections_are_closed_on_return
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::PoolOptions $o = limits(3, 2000);
+    $o->maxIdle = 1;
+    pgsql::Pool $p = $m->pool($o);
+    {
+        pgsql::Lease $a = guard $p->acquire() else ($e) {
+            die("{$e}");
+        }
+        pgsql::Lease $b = guard $p->acquire() else ($e) {
+            die("{$e}");
+        }
+        assert($p->open() == 2);
+        $a->release();
+        // released twice, given back once
+        $a->release();
+        assert($p->idle() == 1);
+    }
+    assert($p->open() == 1);
+    assert($p->idle() == 1);
+    thread::sleep(100);
+    assert($m->seen()->quits == 1);
+    $p->close();
+    $m->l->close();
+}
+
+test a_connection_past_its_lifetime_is_closed_when_it_comes_back
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::PoolOptions $o = limits(2, 2000);
+    $o->maxLifetime = time::duration::millis(50);
+    pgsql::Pool $p = $m->pool($o);
+    {
+        pgsql::Lease $l = guard $p->acquire() else ($e) {
+            die("{$e}");
+        }
+        thread::sleep(100);
+    }
+    assert($p->open() == 0);
+    assert($p->idle() == 0);
+    did($p->exec('UPDATE t SET a = 1'));
+    assert($m->seen()->logins == 2);
+    $p->close();
+    $m->l->close();
+}
+
+test an_idle_connection_past_its_timeout_is_not_lent
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::PoolOptions $o = limits(2, 2000);
+    $o->idleTimeout = time::duration::millis(50);
+    pgsql::Pool $p = $m->pool($o);
+    did($p->exec('UPDATE t SET a = 1'));
+    thread::sleep(100);
+    did($p->exec('UPDATE t SET a = 2'));
+    assert($m->seen()->logins == 2);
+    assert($p->open() == 1);
+    thread::sleep(100);
+    assert($m->seen()->quits == 1);
+    $p->close();
+    $m->l->close();
+}
+
+test a_connection_idle_a_while_is_pinged_and_replaced_when_gone
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::PoolOptions $o = limits(1, 2000);
+    $o->pingAfterIdle = time::duration::millis(20);
+    pgsql::Pool $p = $m->pool($o);
+    did($p->exec('UPDATE t SET a = 1'));
+    // lent again at once: no ping
+    did($p->exec('UPDATE t SET a = 2'));
+    assert($m->seen()->pings == 0);
+    thread::sleep(60);
+    did($p->exec('UPDATE t SET a = 3'));
+    assert($m->seen()->pings == 1);
+    assert($m->seen()->logins == 1);
+    // the server drops the connection while it is idle: the ping finds out, not the caller
+    did($p->exec('HANGUP'));
+    thread::sleep(60);
+    did($p->exec('UPDATE t SET a = 4'));
+    assert($m->seen()->logins == 2);
+    assert($p->open() == 1);
+    $p->close();
+    $m->l->close();
+}
+
+test a_pool_transaction_hands_back_its_value
+{
+    Many $m = Many();
+    $m->start();
+    pgsql::Pool $p = $m->pool(limits(1, 2000));
+    result<uint64, pgsql::Error> $n = $p->transaction<uint64>(function(pgsql::Connection $c) : result<uint64, pgsql::Error> {
+        pgsql::Outcome $o = guard $c->exec('UPDATE t SET a = 1') else ($e) {
+            return .error($e);
+        }
+        return .ok($o->affectedRows);
+    });
+    assert($n->or(0) == 1);
+    assert($m->seen()->rollbacks == 0);
+    // given back idle, outside a transaction
+    assert($p->idle() == 1);
+    pgsql::Lease $l = guard $p->acquire() else ($e) {
+        die("{$e}");
+    }
+    assert(!$l->db()->inTransaction());
+    $l->release();
+    $p->close();
     $m->l->close();
 }

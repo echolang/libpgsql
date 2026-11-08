@@ -1012,6 +1012,8 @@ public class Connection
             }
             Columns $found = guard $columns;
             if (!$ph->names->empty() && $ph->names->count() != $types->count()) {
+                // parsed all the same: closed ahead of the next command
+                $this->closing->push($name);
                 status<Error> $rest = $this->settle($by);
                 return .error(.invalid("the server counts {$types->count()} parameters, the SQL names {$ph->names->count()}"));
             }
@@ -1225,6 +1227,16 @@ public class Connection
         $this->ending = $this->ending->settled($s);
         $this->pending = false;
         return .ok;
+    }
+
+    /**
+     * The stream, COPY or pipeline holding the connection is done with it: free again, and how
+     * its command ended, kept by the holder once the connection moves on.
+     */
+    internal function release() : Outcome
+    {
+        $this->busy = false;
+        return $this->ending->settled($this->status);
     }
 
     /**

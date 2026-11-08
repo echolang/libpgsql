@@ -212,6 +212,27 @@ internal class Wire
         return $m->body;
     }
 
+    /**
+     * The next message has to be the simple Query `$sql`.
+     */
+    internal function query(const string& $sql) : void
+    {
+        string $body = $this->expect(pgsql::protocol::QUERY);
+        if ($body != "{$sql}\0") {
+            die("fake: expected query '{$sql}', got '{$body}'");
+        }
+    }
+
+    /**
+     * Answer the simple Query `$sql` with the command tag `$tag`, then ready with `$status`.
+     */
+    internal function answer(const string& $sql, const string& $tag, uint8 $status) : void
+    {
+        $this->query($sql);
+        $this->send(pgsql::protocol::COMMAND_COMPLETE, commandComplete($tag));
+        $this->ready($status);
+    }
+
     internal function bytes(usize $n, int64 $ms) : string
     {
         string? $got = guard $this->r->exactly($this->s, $n, tcp::Deadline(ms: $ms)) else ($e) {
@@ -388,6 +409,22 @@ internal function commandComplete(const string& $tag) : string
     string $b = '';
     putCString($b, $tag);
     return $b;
+}
+
+/**
+ * A CopyInResponse or CopyOutResponse body: text format, `$n` columns.
+ */
+internal function copyFormat(uint16 $n) : string
+{
+    string $fmt = '';
+    $fmt->push(0);
+    tcp::wire::putBe16($fmt, $n);
+    uint16 $i = 0;
+    while ($i < $n) {
+        tcp::wire::putBe16($fmt, 0);
+        $i = $i + 1;
+    }
+    return $fmt;
 }
 
 /**

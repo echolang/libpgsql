@@ -22,6 +22,8 @@ public class Rows : contract::iterable<Row>
     private bool $open;
     private Error? $failure;
     private RowView $view;
+    // how the result ended, kept once it has: the connection moves on to the next command
+    private Outcome $ended;
 
     internal constructor(Connection $db, Columns $columns, tcp::Deadline $by, bool $open)
     {
@@ -30,6 +32,7 @@ public class Rows : contract::iterable<Row>
         $this->open = $open;
         $this->failure = null;
         $this->view = RowView($columns);
+        $this->ended = $db->ending->settled($db->status);
         $db->busy = $open;
     }
 
@@ -48,7 +51,7 @@ public class Rows : contract::iterable<Row>
      */
     public const function outcome() : Outcome
     {
-        return $this->db->ending->settled($this->db->status);
+        return $this->ended;
     }
 
     /**
@@ -140,12 +143,11 @@ public class Rows : contract::iterable<Row>
             return .error($e);
         }
         if ($got == null) {
-            $this->open = false;
             guard $this->db->drain($this->by) else ($e) {
                 $this->stop($e);
                 return .error($e);
             }
-            $this->db->busy = false;
+            $this->end();
         }
         return .ok($got);
     }
@@ -182,9 +184,17 @@ public class Rows : contract::iterable<Row>
         if ($this->failure == null) {
             $this->failure = $e;
         }
-        $this->open = false;
-        $this->db->busy = false;
         $this->db->abandon($e);
+        $this->end();
+    }
+
+    /**
+     * The result is over and the connection read on as far as it could: free, its outcome kept.
+     */
+    private function end() : void
+    {
+        $this->open = false;
+        $this->ended = $this->db->release();
     }
 }
 
